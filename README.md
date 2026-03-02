@@ -43,6 +43,38 @@ The file `data/raw_cycling_data.csv` contains cycling data for multiple battery 
 4. Correct cycle/step indexing to be sequential
 5. Document your cleaning decisions
 
+### Phase 1 implementation in this repo
+
+`phase1_cleaning.py` performs per-cell cleaning for `data/raw_cycling_data.csv` and writes a cleaned dataset plus before/after plots.
+
+- Input: `data/raw_cycling_data.csv` (uses `datetime`, `cell_id`, `cycle`, `step`, `current_A`, `voltage_V`)
+- Processing scope: each `cell_id` is cleaned independently, then concatenated back
+- Datetime check: parses `datetime` and reports missing/invalid timestamp count
+- Missing-value interpolation (`current_A`, `voltage_V`):
+  - if both adjacent rows are same `step` and non-missing -> average
+  - elif previous adjacent row is same `step` and non-missing -> copy previous
+  - elif next adjacent row is same `step` and non-missing -> copy next
+  - else -> keep missing
+- Interpolation audit: prints decision counts (`if`, `elif_prev`, `elif_next`, `none`) per signal and per cell
+- Step correction (phase 1 indexing):
+  - first, fixes short anomalous runs (`<5` rows) when surrounding runs have identical `step` values
+  - then, reindexes step chunks sequentially from `1..N` within each cycle for all cells
+- Cycle correction: if cycle jumps by more than +1, normalizes the tail so transitions are at most +1 while preserving continuity
+- Outputs (per cell): raw and cleaned timeseries plots for `current_A`, `voltage_V`, `cycle`, `step`
+- Outputs (global): `data/phase1_cleaned_data.csv`
+
+#### Run Phase 1 cleaning
+
+```bash
+python phase1_cleaning.py
+```
+
+Key output files:
+
+- `data/phase1_cleaned_data.csv`
+- `outputs/phase1/01_raw_timeseries_CELL_A.png` (and other cells)
+- `outputs/phase1/02_cleaned_timeseries_CELL_A.png` (and other cells)
+
 ---
 
 ## Phase 2: Simulation & Comparison
@@ -61,6 +93,106 @@ The file `data/raw_cycling_data.csv` contains cycling data for multiple battery 
 **Resources**:
 - [PyBaMM Documentation](https://docs.pybamm.org/)
 - [PyBaMM Models](https://docs.pybamm.org/en/stable/source/user_guide/models/)
+
+### Phase 2 implementation in this repo
+
+`phase2_simulation.py` replays the cleaned experimental current profile (`I(t)`) for each selected cell using an SPMe model and compares simulated terminal voltage against measured voltage.
+
+- Input: `data/phase1_cleaned_data.csv` (uses `datetime`, `cell_id`, `current_A`, `voltage_V`)
+- Model: SPMe, no degradation submodels enabled by default
+- Parameter set selection: `Chen2020` or `Chen2020_composite`
+- Composite support: optional silicon ratio (`--si-ratio`) for `Chen2020_composite`
+- Outputs (per cell): comparison csv + voltage overlay plot
+- Outputs (global): `outputs/phase2/simulation_summary.csv` with RMSE by cell
+
+#### Single-cell run
+
+```bash
+python phase2_simulation.py \
+  --cells CELL_A \
+  --capacity-ah 5.0 \
+  --initial-soc 0.95 \
+  --parameter-set Chen2020
+```
+
+#### Multi-cell run (per-cell capacity and SoC)
+
+Create a JSON file, for example `data/phase2_cell_config.json`:
+
+```json
+{
+  "CELL_A": { "capacity_ah": 5.0, "initial_soc": 0.95 },
+  "CELL_B": { "capacity_ah": 4.9, "initial_soc": 0.93 },
+  "CELL_C": { "capacity_ah": 5.1, "initial_soc": 0.90 }
+}
+```
+
+Then run:
+
+```bash
+python phase2_simulation.py \
+  --cells CELL_A CELL_B CELL_C \
+  --cell-config-json data/phase2_cell_config.json \
+  --parameter-set Chen2020_composite \
+  --si-ratio 0.08
+```
+
+If current-sign convention appears inverted relative to PyBaMM in your environment, add `--current-sign -1.0`.
+
+#### Capacity pre-estimation for Phase 2 inputs
+
+Use `phase2_capacity_estimation.py` to estimate per-cell capacity from the requested windows:
+
+- A: cycle 1, step 5 (CC discharge)
+- B: cycle 1, step 7 (fast CC discharge) and cycle 2, step 2 (slow CC discharge)
+- C: cycle 2, step 3 (CC discharge)
+- D: cycle 2, step 1 and step 2 (CC + CV charge)
+- E: cycle 2, step 5 (CC discharge)
+
+Run:
+
+```bash
+python phase2_capacity_estimation.py
+```
+
+Outputs:
+
+- `outputs/phase2/capacity_window_details.csv` (window-by-window integration)
+- `outputs/phase2/capacity_estimates.csv` (per-cell estimated capacity)
+- `outputs/phase2/phase2_cell_config_from_capacity.json` (ready for `--cell-config-json`)
+
+#### Initial SoC estimation using first-step fitting
+
+Use `phase2_initial_soc_estimation.py` to estimate initial SoC for each cell by:
+
+- taking each cell's first step (first contiguous cycle/step block in time)
+- replaying that step's current in SPMe
+- iterating initial SoC to match first-step voltage end-point
+- using bisection when bracketed, with a grid fallback when not bracketed
+
+Example:
+
+```bash
+python phase2_initial_soc_estimation.py \
+  --cells CELL_A CELL_B CELL_C CELL_D CELL_E \
+  --capacity-estimates-csv outputs/phase2/capacity_estimates.csv \
+  --parameter-set Chen2020
+```
+
+Composite example:
+
+```bash
+python phase2_initial_soc_estimation.py \
+  --cells CELL_A CELL_B CELL_C CELL_D CELL_E \
+  --capacity-estimates-csv outputs/phase2/capacity_estimates.csv \
+  --parameter-set Chen2020_composite \
+  --si-ratio 0.08
+```
+
+Outputs:
+
+- `outputs/phase2/initial_soc_estimates.csv`
+- `outputs/phase2/phase2_cell_config_with_estimated_soc.json` (capacity + estimated initial SoC)
 
 ---
 

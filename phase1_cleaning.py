@@ -55,7 +55,7 @@ def plot_timeseries(df: pd.DataFrame, columns: list[str], out_path: Path, mode:s
         axes[i].grid(alpha=0.3)
 
     axes[-1].set_xlabel("datetime")
-    fig.suptitle(mode + " values over datetime")
+    fig.suptitle(mode + "values over datetime")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -142,7 +142,45 @@ def fix_step_short_anomaly_runs(df: pd.DataFrame, max_run_len: int = 4) -> tuple
     return out, corrected
 
 
-def normalize_cycle_jumps_by_shifting_tail(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def _extract_step_runs(steps: list[float]) -> list[tuple[int, int, float]]:
+    runs: list[tuple[int, int, float]] = []
+    if not steps:
+        return runs
+
+    start = 0
+    for pos in range(1, len(steps) + 1):
+        if pos == len(steps) or steps[pos] != steps[start]:
+            runs.append((start, pos - 1, steps[start]))
+            start = pos
+    return runs
+
+
+def reindex_step_by_cell_protocol(df: pd.DataFrame, cell_id: object) -> tuple[pd.DataFrame, int]:
+    out = df.copy()
+    changed_rows = 0
+    cycle_series = out["cycle"].round().astype(int)
+
+    for cycle_number in cycle_series.drop_duplicates().tolist():
+        cycle_mask = cycle_series == cycle_number
+        cycle_idx = out.index[cycle_mask].tolist()
+        cycle_steps = out.loc[cycle_mask, "step"].astype(int).tolist()
+        runs = _extract_step_runs(cycle_steps)
+        run_values = [int(run_val) for _, _, run_val in runs]
+
+        # All cells: reindex run-order sequentially from 1.
+        mapping = list(range(1, len(runs) + 1))
+
+        for (run_start, run_end, _), new_step in zip(runs, mapping):
+            abs_start = cycle_idx[run_start]
+            abs_end = cycle_idx[run_end]
+            original_values = out.loc[abs_start:abs_end, "step"]
+            changed_rows += int((original_values != new_step).sum())
+            out.loc[abs_start:abs_end, "step"] = new_step
+
+    return out, changed_rows
+
+
+def normalize_cycle_jumps_by_shifting_tail(df: pd.DataFrame) -> tuple[pd.DataFrame, int, float]:
     out = df.copy()
     jump_events = 0
     total_shift = 0.0
@@ -166,13 +204,14 @@ def normalize_cycle_jumps_by_shifting_tail(df: pd.DataFrame) -> tuple[pd.DataFra
         if jump > 1:
             extra = jump - 1
             offset += extra
+            total_shift += extra
             adjusted_cycle -= extra
             jump_events += 1
 
         corrected_cycles.append(adjusted_cycle)
 
     out["cycle"] = corrected_cycles
-    return out, jump_events
+    return out, jump_events, total_shift
 
 
 def print_consecutive_summary(title: str, summary: dict[str, dict[str, object]]) -> None:
@@ -217,6 +256,7 @@ def main() -> None:
         cell_tag = sanitize_filename(cell_id)
 
         print(f"\n=== Processing cell_id: {cell_id} ===")
+        print("runs = number of contiguous missing-value segments in time order")
 
         # 1) Visualize values over datetime without filling missing data (per cell).
         plot_timeseries(cell_df, PLOT_COLUMNS, PLOT_DIR / f"01_raw_timeseries_{cell_tag}.png", mode="Raw")
@@ -248,14 +288,20 @@ def main() -> None:
 
         # Apply protocol-index corrections per request.
         cleaned_cell_df, step_fixes = fix_step_short_anomaly_runs(cleaned_cell_df, max_run_len=4)
-        cleaned_cell_df, cycle_fixes = normalize_cycle_jumps_by_shifting_tail(cleaned_cell_df)
+        cleaned_cell_df, cycle_fixes, cycle_total_shift = normalize_cycle_jumps_by_shifting_tail(cleaned_cell_df)
+        cleaned_cell_df, step_reindexed_rows = reindex_step_by_cell_protocol(cleaned_cell_df, cell_id)
         print(f"Step corrections applied: {step_fixes}")
         print(f"Cycle jump events corrected: {cycle_fixes}")
+        print(f"Total cycle shift applied to tail segments: {cycle_total_shift:g}")
+        print(f"Step rows reindexed by protocol mapping: {step_reindexed_rows}")
 
         # 5) Count missing values again after interpolation and index correction (per cell).
         missing_after = count_missing_values(cleaned_cell_df, PLOT_COLUMNS)
         print("\nMissing values AFTER interpolation:")
         print(missing_after.to_string())
+
+        consecutive_after = consecutive_missing_summary(cleaned_cell_df, PLOT_COLUMNS)
+        print_consecutive_summary("Consecutive missing summary AFTER interpolation:", consecutive_after)
 
         # Additional plot: cleaned values over datetime after interpolation.
         plot_timeseries(cleaned_cell_df, PLOT_COLUMNS, PLOT_DIR / f"02_cleaned_timeseries_{cell_tag}.png", mode="Cleaned")
