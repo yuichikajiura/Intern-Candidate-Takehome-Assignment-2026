@@ -105,8 +105,10 @@ Key output files:
 - Model: SPMe, no degradation submodels enabled by default
 - Parameter set selection: `Chen2020` or `Chen2020_composite`
 - Composite support: optional silicon ratio (`--si-ratio`) for `Chen2020_composite`
-- Outputs (per cell): comparison csv + voltage overlay plot
-- Outputs (global): `outputs/phase2/simulation_summary.csv` with RMSE by cell
+- Capacity handling: `capacity_ah` is applied to nominal capacity and used to scale parallel-electrode count so capacity impacts current-driven dynamics
+- Outputs on successful completion:
+  - per cell: `outputs/phase2/<CELL>_comparison.csv`, `outputs/phase2/<CELL>_voltage_compare.png`
+  - global: `outputs/phase2/simulation_summary.csv` with RMSE by cell and run metadata
 
 #### Single-cell run
 
@@ -115,32 +117,38 @@ python phase2_simulation.py \
   --cells CELL_A \
   --capacity-ah 5.0 \
   --initial-soc 0.95 \
-  --parameter-set Chen2020
+  --parameter-set Chen2020_composite \
+  --si-ratio 0.08
 ```
 
 #### Multi-cell run (per-cell capacity and SoC)
 
-Create a JSON file, for example `data/phase2_cell_config.json`:
+Create a JSON file, for example `data/phase2_cell_config.json` (storing values hand-tuned):
 
 ```json
 {
-  "CELL_A": { "capacity_ah": 5.0, "initial_soc": 0.95 },
-  "CELL_B": { "capacity_ah": 4.9, "initial_soc": 0.93 },
-  "CELL_C": { "capacity_ah": 5.1, "initial_soc": 0.90 }
+  "CELL_A": { "capacity_ah": 6.88, "initial_soc": 0.85 },
+  "CELL_B": { "capacity_ah": 1.125, "initial_soc": 0.60 },
+  "CELL_C": { "capacity_ah": 5.6, "initial_soc": 0.91 },
+  "CELL_D": { "capacity_ah": 1.2, "initial_soc": 0.77 },
+  "CELL_E": { "capacity_ah": 0.204, "initial_soc": 0.80 }
 }
+
 ```
 
 Then run:
 
 ```bash
 python phase2_simulation.py \
-  --cells CELL_A CELL_B CELL_C \
+  --cells CELL_A CELL_B CELL_C CELL_D CELL_E \
   --cell-config-json data/phase2_cell_config.json \
-  --parameter-set Chen2020_composite \
-  --si-ratio 0.08
+  --parameter-set Chen2020
 ```
 
 If current-sign convention appears inverted relative to PyBaMM in your environment, add `--current-sign -1.0`.
+To override voltage limits, add `--voltage-max 4.5 --voltage-min 2.0` (these are already defaults).
+
+Following codes are used for initial guesses before hand-tuning capacity and initial SoCs for each cell.
 
 #### Capacity pre-estimation for Phase 2 inputs
 

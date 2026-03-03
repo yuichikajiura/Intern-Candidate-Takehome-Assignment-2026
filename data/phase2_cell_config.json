@@ -1,0 +1,22 @@
+{
+  "CELL_A": {
+    "capacity_ah": 6.88,
+    "initial_soc": 0.85
+  },
+  "CELL_B": {
+    "capacity_ah": 1.125,
+    "initial_soc": 0.60
+  },
+  "CELL_C": {
+    "capacity_ah": 5.6,
+    "initial_soc": 0.91
+  },
+  "CELL_D": {
+    "capacity_ah": 1.2,
+    "initial_soc": 0.77
+  },
+  "CELL_E": {
+    "capacity_ah": 0.204,
+    "initial_soc": 0.80
+  }
+}
