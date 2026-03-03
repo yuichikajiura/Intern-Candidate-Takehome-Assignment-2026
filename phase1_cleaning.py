@@ -228,6 +228,31 @@ def sanitize_filename(value: object) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
 
 
+def count_non_incremental_datetime(datetimes: pd.Series) -> int:
+    prev = datetimes.shift(1)
+    valid_pair = datetimes.notna() & prev.notna()
+    non_incremental = valid_pair & (datetimes <= prev)
+    return int(non_incremental.sum())
+
+
+def drop_non_incremental_datetime_rows_by_cell(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int], int]:
+    kept_parts: list[pd.DataFrame] = []
+    dropped_by_cell: dict[str, int] = {}
+
+    for cell_id, cell_df in df.groupby("cell_id", sort=False):
+        prev = cell_df["datetime"].shift(1)
+        valid_pair = cell_df["datetime"].notna() & prev.notna()
+        drop_mask = valid_pair & (cell_df["datetime"] <= prev)
+        dropped = int(drop_mask.sum())
+        dropped_by_cell[str(cell_id)] = dropped
+        kept_parts.append(cell_df.loc[~drop_mask].copy())
+
+    dropped_total = sum(dropped_by_cell.values())
+    return pd.concat(kept_parts, ignore_index=True), dropped_by_cell, dropped_total
+
+
 def main() -> None:
     if not RAW_CSV_PATH.exists():
         raise FileNotFoundError(f"Input file not found: {RAW_CSV_PATH}")
@@ -246,6 +271,24 @@ def main() -> None:
     else:
         print("datetime column has no missing values.")
 
+    per_cell_non_incremental: dict[str, int] = {}
+    for cell_id, cell_df in df.groupby("cell_id", sort=False):
+        per_cell_non_incremental[str(cell_id)] = count_non_incremental_datetime(cell_df["datetime"])
+
+    global_non_incremental = sum(per_cell_non_incremental.values())
+    print(f"Global non-incremental datetime transitions (within each cell): {global_non_incremental}")
+    if global_non_incremental > 0:
+        print("Warning: datetime is not strictly increasing for some rows; those rows will be dropped.")
+        for cell_id, count in per_cell_non_incremental.items():
+            print(f"- {cell_id}: {count}")
+        df, dropped_by_cell, dropped_total = drop_non_incremental_datetime_rows_by_cell(df)
+        print(f"Dropped non-incremental datetime rows total: {dropped_total}")
+        for cell_id, count in dropped_by_cell.items():
+            if count > 0:
+                print(f"  dropped in {cell_id}: {count}")
+    else:
+        print("datetime is strictly increasing within each cell.")
+
     if "cell_id" not in df.columns:
         raise KeyError("cell_id column is required for per-cell processing.")
 
@@ -257,6 +300,8 @@ def main() -> None:
 
         print(f"\n=== Processing cell_id: {cell_id} ===")
         print("runs = number of contiguous missing-value segments in time order")
+        cell_non_incremental = count_non_incremental_datetime(cell_df["datetime"])
+        print(f"Datetime non-incremental transitions in this cell after drop: {cell_non_incremental}")
 
         # 1) Visualize values over datetime without filling missing data (per cell).
         plot_timeseries(cell_df, PLOT_COLUMNS, PLOT_DIR / f"01_raw_timeseries_{cell_tag}.png", mode="Raw")

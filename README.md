@@ -49,7 +49,10 @@ The file `data/raw_cycling_data.csv` contains cycling data for multiple battery 
 
 - Input: `data/raw_cycling_data.csv` (uses `datetime`, `cell_id`, `cycle`, `step`, `current_A`, `voltage_V`)
 - Processing scope: each `cell_id` is cleaned independently, then concatenated back
-- Datetime check: parses `datetime` and reports missing/invalid timestamp count
+- Datetime quality checks:
+  - parses `datetime` and reports missing/invalid timestamp count
+  - checks strict increment within each `cell_id`
+  - drops rows with non-incremental timestamps (`datetime <= previous datetime` in the same cell)
 - Missing-value interpolation (`current_A`, `voltage_V`):
   - if both adjacent rows are same `step` and non-missing -> average
   - elif previous adjacent row is same `step` and non-missing -> copy previous
