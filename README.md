@@ -172,6 +172,35 @@ Outputs:
 - `outputs/phase2/capacity_estimates.csv` (per-cell estimated capacity)
 - `outputs/phase2/phase2_cell_config_from_capacity.json` (ready for `--cell-config-json`)
 
+#### Capacity decay from early vs late cycles
+
+Use `phase2_capacity_decay.py` to compute capacity decay using the same step definitions:
+
+- A: step 5
+- B: step 7
+- C: step 3
+- D: steps 1 and 2
+- E: step 5
+
+Comparison windows:
+
+- `CELL_A`, `CELL_B`, `CELL_C`, `CELL_E`: first cycle vs last cycle
+
+Special baseline rule:
+
+- `CELL_D`: baseline is fixed to cycle 2 (steps 1 and 2), then compared to the last cycle
+
+Run:
+
+```bash
+python phase2_capacity_decay.py
+```
+
+Outputs:
+
+- `outputs/phase2/capacity_decay_details.csv` (per cycle/step integration details)
+- `outputs/phase2/capacity_decay_summary.csv` (per-cell decay in Ah and %)
+
 #### Initial SoC estimation using first-step fitting
 
 Use `phase2_initial_soc_estimation.py` to estimate initial SoC for each cell by:
