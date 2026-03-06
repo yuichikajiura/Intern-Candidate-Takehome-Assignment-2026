@@ -12,12 +12,13 @@ import pybamm
 
 INPUT_CSV_PATH = Path("data/phase1_cleaned_data.csv")
 OUTPUT_DIR = Path("outputs/phase2")
+DEFAULT_MODEL_NAME = "SPMe"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run SPMe simulations against cleaned experimental data for one or more "
+            "Run battery-model simulations against cleaned experimental data for one or more "
             "cells and compare voltage traces."
         )
     )
@@ -61,28 +62,22 @@ def parse_args() -> argparse.Namespace:
         help="Initial SoC in [0, 1] for single-cell mode.",
     )
     parser.add_argument(
+        "--max-cycle",
+        type=float,
+        default=None,
+        help="Optional inclusive upper cycle index to simulate (e.g., 50).",
+    )
+    parser.add_argument(
+        "--model-name",
+        choices=["SPM", "SPMe", "DFN"],
+        default=DEFAULT_MODEL_NAME,
+        help="PyBaMM lithium-ion model type.",
+    )
+    parser.add_argument(
         "--parameter-set",
-        choices=["Chen2020", "Chen2020_composite"],
+        choices=["Chen2020"],
         default="Chen2020",
-        help="PyBaMM parameter set for SPMe simulation.",
-    )
-    parser.add_argument(
-        "--si-ratio",
-        type=float,
-        default=0.0,
-        help=(
-            "Silicon fraction in negative active material for "
-            "Chen2020_composite, in [0, 1]."
-        ),
-    )
-    parser.add_argument(
-        "--current-sign",
-        type=float,
-        default=1.0,
-        help=(
-            "Multiplier applied to experimental current before simulation. "
-            "Use -1.0 to flip sign convention."
-        ),
+        help="PyBaMM parameter set.",
     )
     parser.add_argument(
         "--solver-mode",
@@ -110,13 +105,15 @@ def read_and_prepare_data(input_csv: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Input CSV not found: {input_csv}")
 
     df = pd.read_csv(input_csv)
-    required_columns = {"datetime", "cell_id", "current_A", "voltage_V"}
+    required_columns = {"datetime", "cell_id", "cycle", "step", "current_A", "voltage_V"}
     missing = sorted(required_columns - set(df.columns))
     if missing:
         raise KeyError(f"Missing required columns in {input_csv}: {missing}")
 
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df = df.dropna(subset=["datetime", "current_A", "voltage_V"]).copy()
+    df["cycle"] = pd.to_numeric(df["cycle"], errors="coerce")
+    df["step"] = pd.to_numeric(df["step"], errors="coerce")
+    df = df.dropna(subset=["datetime", "cycle", "step", "current_A", "voltage_V"]).copy()
     df = df.sort_values(["cell_id", "datetime"]).reset_index(drop=True)
     return df
 
@@ -191,49 +188,6 @@ def get_cell_initial_conditions(
     return capacity_ah, initial_soc
 
 
-def _first_matching_key(keys: list[str], required_substrings: list[str]) -> str | None:
-    required = [s.lower() for s in required_substrings]
-    for key in keys:
-        key_l = key.lower()
-        if all(token in key_l for token in required):
-            return key
-    return None
-
-
-def apply_composite_si_ratio(
-    parameter_values: pybamm.ParameterValues,
-    si_ratio: float,
-) -> None:
-    if not (0.0 <= si_ratio <= 1.0):
-        raise ValueError(f"--si-ratio must be in [0, 1], got {si_ratio}.")
-
-    keys = list(parameter_values.keys())
-    primary_key = _first_matching_key(
-        keys,
-        ["primary", "negative electrode active material volume fraction"],
-    )
-    secondary_key = _first_matching_key(
-        keys,
-        ["secondary", "negative electrode active material volume fraction"],
-    )
-    if primary_key is None or secondary_key is None:
-        raise KeyError(
-            "Could not find composite negative electrode volume-fraction keys in "
-            "parameter set. Check your PyBaMM version supports Chen2020_composite."
-        )
-
-    primary_base = float(parameter_values[primary_key])
-    secondary_base = float(parameter_values[secondary_key])
-    total_active_fraction = primary_base + secondary_base
-
-    parameter_values.update(
-        {
-            primary_key: (1.0 - si_ratio) * total_active_fraction,
-            secondary_key: si_ratio * total_active_fraction,
-        }
-    )
-
-
 def apply_capacity_scaling(
     parameter_values: pybamm.ParameterValues,
     target_capacity_ah: float,
@@ -269,31 +223,40 @@ def build_simulation(
     return pybamm.Simulation(model=model, parameter_values=parameter_values, solver=solver)
 
 
+def make_model(model_name: str) -> pybamm.BaseModel:
+    model_builders: dict[str, object] = {
+        "SPM": pybamm.lithium_ion.SPM,
+        "SPMe": pybamm.lithium_ion.SPMe,
+        "DFN": pybamm.lithium_ion.DFN,
+    }
+    if model_name not in model_builders:
+        raise ValueError(f"Unsupported model_name: {model_name}")
+
+    builder = model_builders[model_name]
+    return builder()
+
+
 def run_cell_simulation(
     cell_df: pd.DataFrame,
+    model_name: str,
     parameter_set: str,
-    si_ratio: float,
     capacity_ah: float,
     initial_soc: float,
-    current_sign: float,
     solver_mode: str,
     voltage_max: float | None,
     voltage_min: float | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, str]:
     t_s = (cell_df["datetime"] - cell_df["datetime"].iloc[0]).dt.total_seconds().to_numpy()
-    i_exp = cell_df["current_A"].to_numpy(dtype=float) * float(current_sign)
+    i_exp = cell_df["current_A"].to_numpy(dtype=float)
     v_exp = cell_df["voltage_V"].to_numpy(dtype=float)
 
-    model = pybamm.lithium_ion.SPMe()
+    model = make_model(model_name)
     parameter_values = pybamm.ParameterValues(parameter_set)
     capacity_scale = apply_capacity_scaling(parameter_values, float(capacity_ah))
     if voltage_max is not None:
         parameter_values.update({"Upper voltage cut-off [V]": float(voltage_max)})
     if voltage_min is not None:
         parameter_values.update({"Lower voltage cut-off [V]": float(voltage_min)})
-
-    if parameter_set == "Chen2020_composite":
-        apply_composite_si_ratio(parameter_values, si_ratio)
 
     sim = build_simulation(model, parameter_values, t_s, i_exp, solver_mode)
     solution = sim.solve(t_eval=t_s, initial_soc=float(initial_soc))
@@ -306,6 +269,7 @@ def run_cell_simulation(
 
 def save_voltage_compare_plot(
     cell_id: str,
+    model_name: str,
     t_exp: np.ndarray,
     v_exp: np.ndarray,
     t_sim: np.ndarray,
@@ -315,10 +279,10 @@ def save_voltage_compare_plot(
 ) -> None:
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(t_exp / 3600.0, v_exp, label="Experimental", linewidth=1.0)
-    ax.plot(t_sim / 3600.0, v_sim, label="SPMe simulated", linewidth=1.0)
+    ax.plot(t_sim / 3600.0, v_sim, label=f"{model_name} simulated", linewidth=1.0)
     ax.set_xlabel("Time [h]")
     ax.set_ylabel("Voltage [V]")
-    title = f"{cell_id}: Experimental vs SPMe"
+    title = f"{cell_id}: Experimental vs {model_name}"
     if title_suffix:
         title += f" ({title_suffix})"
     ax.set_title(title)
@@ -331,6 +295,7 @@ def save_voltage_compare_plot(
 
 def save_early_termination_diagnostics(
     cell_id: str,
+    model_name: str,
     t_exp: np.ndarray,
     v_exp: np.ndarray,
     t_sim: np.ndarray,
@@ -346,6 +311,7 @@ def save_early_termination_diagnostics(
     # Always produce the standard comparison plot, even for early termination.
     save_voltage_compare_plot(
         cell_id=cell_id,
+        model_name=model_name,
         t_exp=t_exp,
         v_exp=v_exp,
         t_sim=t_sim,
@@ -355,23 +321,20 @@ def save_early_termination_diagnostics(
     )
 
 
-
-def save_outputs(
+def make_comparison_df(
     cell_id: str,
     cell_df: pd.DataFrame,
     t_s: np.ndarray,
     i_exp: np.ndarray,
     v_exp: np.ndarray,
     v_sim: np.ndarray,
-    output_dir: Path,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_cell = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(cell_id))
-
-    comparison_df = pd.DataFrame(
+) -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "datetime": cell_df["datetime"].to_numpy(),
             "cell_id": cell_id,
+            "cycle": cell_df["cycle"].to_numpy() if "cycle" in cell_df.columns else np.nan,
+            "step": cell_df["step"].to_numpy() if "step" in cell_df.columns else np.nan,
             "time_s": t_s,
             "current_A_sim_input": i_exp,
             "voltage_exp_V": v_exp,
@@ -379,10 +342,25 @@ def save_outputs(
             "voltage_error_V": v_sim - v_exp,
         }
     )
+
+
+
+def save_outputs(
+    cell_id: str,
+    model_name: str,
+    comparison_df: pd.DataFrame,
+    t_s: np.ndarray,
+    v_exp: np.ndarray,
+    v_sim: np.ndarray,
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_cell = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(cell_id))
     comparison_df.to_csv(output_dir / f"{safe_cell}_comparison.csv", index=False)
 
     save_voltage_compare_plot(
         cell_id=cell_id,
+        model_name=model_name,
         t_exp=t_s,
         v_exp=v_exp,
         t_sim=t_s,
@@ -391,36 +369,52 @@ def save_outputs(
     )
 
 
-def main() -> None:
-    args = parse_args()
-    df = read_and_prepare_data(args.input_csv)
-    config_map = load_cell_config(args.cell_config_json)
-    cells = determine_cells(df, args.cells, config_map)
-
+def simulate_cells(
+    df: pd.DataFrame,
+    cells: list[str],
+    config_map: dict[str, dict[str, float]],
+    fallback_capacity_ah: float | None,
+    fallback_initial_soc: float | None,
+    output_dir: Path,
+    max_cycle: float | None = None,
+    model_name: str = DEFAULT_MODEL_NAME,
+    parameter_set: str = "Chen2020",
+    solver_mode: str = "safe",
+    voltage_max: float | None = None,
+    voltage_min: float | None = None,
+    save_files: bool = True,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     summary_rows: list[dict[str, object]] = []
+    comparison_by_cell: dict[str, pd.DataFrame] = {}
+
     for cell_id in cells:
         cell_df = df[df["cell_id"] == cell_id].copy()
+        if max_cycle is not None:
+            cell_df = cell_df[cell_df["cycle"] <= float(max_cycle)].copy()
+        if cell_df.empty:
+            raise ValueError(
+                f"No data left for {cell_id} after applying max_cycle={max_cycle}."
+            )
         capacity_ah, initial_soc = get_cell_initial_conditions(
             cell_id=cell_id,
             config_map=config_map,
-            fallback_capacity_ah=args.capacity_ah,
-            fallback_initial_soc=args.initial_soc,
+            fallback_capacity_ah=fallback_capacity_ah,
+            fallback_initial_soc=fallback_initial_soc,
         )
 
         print(
-            f"Simulating {cell_id}: parameter_set={args.parameter_set}, "
-            f"capacity_ah={capacity_ah}, initial_soc={initial_soc}, si_ratio={args.si_ratio}"
+            f"Simulating {cell_id}: model={model_name}, parameter_set={parameter_set}, "
+            f"capacity_ah={capacity_ah}, initial_soc={initial_soc}"
         )
         t_s, i_exp, v_exp, t_sim, v_sim, capacity_scale, termination_reason = run_cell_simulation(
             cell_df=cell_df,
-            parameter_set=args.parameter_set,
-            si_ratio=args.si_ratio,
+            model_name=model_name,
+            parameter_set=parameter_set,
             capacity_ah=capacity_ah,
             initial_soc=initial_soc,
-            current_sign=args.current_sign,
-            solver_mode=args.solver_mode,
-            voltage_max=args.voltage_max,
-            voltage_min=args.voltage_min,
+            solver_mode=solver_mode,
+            voltage_max=voltage_max,
+            voltage_min=voltage_min,
         )
         print(f"{cell_id}: capacity scaling factor vs base set = {capacity_scale:.6f}")
 
@@ -428,46 +422,104 @@ def main() -> None:
         if len(v_sim) != len(v_exp) or len(t_sim) != len(t_s) or not np.isclose(
             t_sim[-1], t_s[-1], atol=1e-8, rtol=0.0
         ):
-            save_early_termination_diagnostics(
-                cell_id=cell_id,
-                t_exp=t_s,
-                v_exp=v_exp,
-                t_sim=t_sim,
-                v_sim=v_sim,
-                output_dir=args.output_dir,
-            )
+            if save_files:
+                save_early_termination_diagnostics(
+                    cell_id=cell_id,
+                    model_name=model_name,
+                    t_exp=t_s,
+                    v_exp=v_exp,
+                    t_sim=t_sim,
+                    v_sim=v_sim,
+                    output_dir=output_dir,
+                )
             raise RuntimeError(
                 "Simulation terminated before full current profile completed. "
                 f"cell_id={cell_id}, sim_points={len(v_sim)}, exp_points={len(v_exp)}, "
                 f"sim_end_s={t_sim[-1] if len(t_sim) else np.nan:.6f}, exp_end_s={t_s[-1]:.6f}. "
                 f"termination_reason={termination_reason}. "
-                f"Diagnostic files saved to {args.output_dir}."
+                f"Diagnostic files saved to {output_dir}."
             )
-        save_outputs(
+        comparison_df = make_comparison_df(
             cell_id=cell_id,
             cell_df=cell_df,
             t_s=t_s,
             i_exp=i_exp,
             v_exp=v_exp,
             v_sim=v_sim,
-            output_dir=args.output_dir,
         )
+        comparison_by_cell[cell_id] = comparison_df
+        if save_files:
+            save_outputs(
+                cell_id=cell_id,
+                model_name=model_name,
+                comparison_df=comparison_df,
+                t_s=t_s,
+                v_exp=v_exp,
+                v_sim=v_sim,
+                output_dir=output_dir,
+            )
 
         rmse = float(np.sqrt(np.mean((v_sim - v_exp) ** 2)))
         summary_rows.append(
             {
                 "cell_id": cell_id,
-                "parameter_set": args.parameter_set,
-                "si_ratio": args.si_ratio if args.parameter_set == "Chen2020_composite" else np.nan,
+                "model_name": model_name,
+                "parameter_set": parameter_set,
                 "capacity_ah": capacity_ah,
                 "initial_soc": initial_soc,
+                "max_cycle_requested": max_cycle,
+                "max_cycle_included": float(cell_df["cycle"].max()),
+                "capacity_scale": capacity_scale,
+                "solver_mode": solver_mode,
+                "voltage_min": voltage_min,
+                "voltage_max": voltage_max,
+                "termination_reason": termination_reason,
                 "rmse_V": rmse,
             }
         )
         print(f"Completed {cell_id}: RMSE={rmse:.6f} V")
 
+    return pd.DataFrame(summary_rows), comparison_by_cell
+
+
+def main() -> None:
+    args = parse_args()
+    df = read_and_prepare_data(args.input_csv)
+    config_map = load_cell_config(args.cell_config_json)
+    cells = determine_cells(df, args.cells, config_map)
+
+    if args.model_name == "DFN":
+        max_points = int(df[df["cell_id"].isin(cells)].groupby("cell_id").size().max())
+        if max_points > 50000:
+            print(
+                "Warning: DFN on very long profiles can be extremely slow "
+                f"(up to {max_points} points per selected cell). "
+                "If needed, try --solver-mode fast or use SPMe/SPM for screening."
+            )
+
+    try:
+        summary_df, _ = simulate_cells(
+            df=df,
+            cells=cells,
+            config_map=config_map,
+            fallback_capacity_ah=args.capacity_ah,
+            fallback_initial_soc=args.initial_soc,
+            output_dir=args.output_dir,
+        max_cycle=args.max_cycle,
+            model_name=args.model_name,
+            parameter_set=args.parameter_set,
+            solver_mode=args.solver_mode,
+            voltage_max=args.voltage_max,
+            voltage_min=args.voltage_min,
+            save_files=True,
+        )
+    except KeyboardInterrupt:
+        print(
+            "\nSimulation interrupted by user (KeyboardInterrupt). "
+            "For DFN long runs, consider --solver-mode fast or SPMe/SPM."
+        )
+        raise
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(args.output_dir / "simulation_summary.csv", index=False)
     print(f"Saved summary: {args.output_dir / 'simulation_summary.csv'}")
 

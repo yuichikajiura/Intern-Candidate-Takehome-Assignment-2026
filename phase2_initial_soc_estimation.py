@@ -41,11 +41,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parameter-set",
-        choices=["Chen2020", "Chen2020_composite"],
+        choices=["Chen2020"],
         default="Chen2020",
     )
-    parser.add_argument("--si-ratio", type=float, default=0.0)
-    parser.add_argument("--current-sign", type=float, default=1.0)
     parser.add_argument("--solver-mode", choices=["safe", "fast"], default="safe")
     parser.add_argument("--soc-lower", type=float, default=0.01)
     parser.add_argument("--soc-upper", type=float, default=0.99)
@@ -140,42 +138,8 @@ def first_step_segment(cell_df: pd.DataFrame) -> tuple[pd.DataFrame, float, floa
     return seg, first_cycle, first_step
 
 
-def _first_matching_key(keys: list[str], required_substrings: list[str]) -> str | None:
-    required = [s.lower() for s in required_substrings]
-    for key in keys:
-        key_l = key.lower()
-        if all(token in key_l for token in required):
-            return key
-    return None
-
-
-def apply_composite_si_ratio(parameter_values: pybamm.ParameterValues, si_ratio: float) -> None:
-    if not (0.0 <= si_ratio <= 1.0):
-        raise ValueError(f"--si-ratio must be in [0, 1], got {si_ratio}.")
-    keys = list(parameter_values.keys())
-    primary_key = _first_matching_key(
-        keys,
-        ["primary", "negative electrode active material volume fraction"],
-    )
-    secondary_key = _first_matching_key(
-        keys,
-        ["secondary", "negative electrode active material volume fraction"],
-    )
-    if primary_key is None or secondary_key is None:
-        raise KeyError(
-            "Composite negative electrode keys not found in parameter set. "
-            "Check PyBaMM version for Chen2020_composite support."
-        )
-
-    primary_base = float(parameter_values[primary_key])
-    secondary_base = float(parameter_values[secondary_key])
-    total = primary_base + secondary_base
-    parameter_values.update(
-        {
-            primary_key: (1.0 - si_ratio) * total,
-            secondary_key: si_ratio * total,
-        }
-    )
+def make_model() -> pybamm.BaseModel:
+    return pybamm.lithium_ion.SPMe()
 
 
 def run_first_step_voltage(
@@ -183,19 +147,15 @@ def run_first_step_voltage(
     capacity_ah: float,
     initial_soc: float,
     parameter_set: str,
-    si_ratio: float,
-    current_sign: float,
     solver_mode: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     t_s = (seg["datetime"] - seg["datetime"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
-    i_exp = seg["current_A"].to_numpy(dtype=float) * float(current_sign)
+    i_exp = seg["current_A"].to_numpy(dtype=float)
     v_exp = seg["voltage_V"].to_numpy(dtype=float)
 
-    model = pybamm.lithium_ion.SPMe()
+    model = make_model()
     params = pybamm.ParameterValues(parameter_set)
     params.update({"Nominal cell capacity [A.h]": float(capacity_ah)})
-    if parameter_set == "Chen2020_composite":
-        apply_composite_si_ratio(params, si_ratio)
 
     params.update({"Current function [A]": pybamm.Interpolant(t_s, i_exp, pybamm.t)})
     sim = pybamm.Simulation(
@@ -219,8 +179,6 @@ def objective_end_voltage_error(
         capacity_ah=capacity_ah,
         initial_soc=soc,
         parameter_set=args.parameter_set,
-        si_ratio=args.si_ratio,
-        current_sign=args.current_sign,
         solver_mode=args.solver_mode,
     )
     end_err = float(v_sim[-1] - v_exp[-1])
@@ -279,7 +237,7 @@ def estimate_soc_for_cell(
         reasons = sorted({str(ev.get("reason", "unknown")) for ev in evals})
         raise ValueError(
             "No feasible SoC found in search range. "
-            f"Try narrowing soc bounds or changing current-sign. reasons={reasons}"
+            f"Try narrowing soc bounds. reasons={reasons}"
         )
 
     # Prefer bisection if a valid sign-changing bracket exists among sampled points.
@@ -411,7 +369,6 @@ def main() -> None:
                 ),
                 "capacity_ah": capacity_ah,
                 "parameter_set": args.parameter_set,
-                "si_ratio": args.si_ratio if args.parameter_set == "Chen2020_composite" else np.nan,
                 "estimated_initial_soc": est_soc,
                 "method": result["method"],
                 "iterations": result["iterations"],

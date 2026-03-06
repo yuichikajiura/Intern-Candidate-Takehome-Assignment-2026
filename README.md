@@ -99,13 +99,16 @@ Key output files:
 
 ### Phase 2 implementation in this repo
 
-`phase2_simulation.py` replays the cleaned experimental current profile (`I(t)`) for each selected cell using an SPMe model and compares simulated terminal voltage against measured voltage.
+`phase2_simulation.py` replays the cleaned experimental current profile (`I(t)`) for each selected cell using the selected model (`SPM` / `SPMe` / `DFN`) and compares simulated terminal voltage against measured voltage.
 
-- Input: `data/phase1_cleaned_data.csv` (uses `datetime`, `cell_id`, `current_A`, `voltage_V`)
-- Model: SPMe, no degradation submodels enabled by default
-- Parameter set selection: `Chen2020` or `Chen2020_composite`
-- Composite support: optional silicon ratio (`--si-ratio`) for `Chen2020_composite`
+- Input: `data/phase1_cleaned_data.csv` (uses `datetime`, `cell_id`, `cycle`, `step`, `current_A`, `voltage_V`)
+- Model selection: `SPM`, `SPMe`, or `DFN` (`--model-name`, default `SPMe`)
+- Parameter set: `Chen2020` (composite support removed)
 - Capacity handling: `capacity_ah` is applied to nominal capacity and used to scale parallel-electrode count so capacity impacts current-driven dynamics
+- Reusable API for Phase 4:
+  - `make_comparison_df(...)` builds per-cell simulation-vs-experiment DataFrame
+  - `simulate_cells(...)` returns `(summary_df, comparison_by_cell)` and can skip file writes with `save_files=False`
+- Summary metadata includes model/config fields (`model_name`, `solver_mode`, `voltage_min`, `voltage_max`) for DB insertion
 - Outputs on successful completion:
   - per cell: `outputs/phase2/<CELL>_comparison.csv`, `outputs/phase2/<CELL>_voltage_compare.png`
   - global: `outputs/phase2/simulation_summary.csv` with RMSE by cell and run metadata
@@ -117,8 +120,8 @@ python phase2_simulation.py \
   --cells CELL_A \
   --capacity-ah 5.0 \
   --initial-soc 0.95 \
-  --parameter-set Chen2020_composite \
-  --si-ratio 0.08
+  --model-name SPMe \
+  --parameter-set Chen2020
 ```
 
 #### Multi-cell run (per-cell capacity and SoC)
@@ -142,11 +145,12 @@ Then run:
 python phase2_simulation.py \
   --cells CELL_A CELL_B CELL_C CELL_D CELL_E \
   --cell-config-json data/phase2_cell_config.json \
+  --model-name DFN \
   --parameter-set Chen2020
 ```
 
-If current-sign convention appears inverted relative to PyBaMM in your environment, add `--current-sign -1.0`.
-To override voltage limits, add `--voltage-max 4.5 --voltage-min 2.0` (these are already defaults).
+To override voltage limits, add `--voltage-max 4.5 --voltage-min 2.0` (these are defaults).
+To simulate only early life cycles, add `--max-cycle <N>` (inclusive), e.g. `--max-cycle 50`.
 
 Following codes are used for initial guesses before hand-tuning capacity and initial SoCs for each cell.
 
@@ -219,16 +223,6 @@ python phase2_initial_soc_estimation.py \
   --parameter-set Chen2020
 ```
 
-Composite example:
-
-```bash
-python phase2_initial_soc_estimation.py \
-  --cells CELL_A CELL_B CELL_C CELL_D CELL_E \
-  --capacity-estimates-csv outputs/phase2/capacity_estimates.csv \
-  --parameter-set Chen2020_composite \
-  --si-ratio 0.08
-```
-
 Outputs:
 
 - `outputs/phase2/initial_soc_estimates.csv`
@@ -257,6 +251,40 @@ Consider how to store:
 - Simulation results
 
 You do not need to implement the database, just design the schema. You can use any database schema design tool or just describe the schema in text using exact key names and relationship maps.
+
+### Phase 3 implementation in this repo
+
+designed as a SQLite schema.
+
+Tables:
+
+- `cells`: cell master (`CELL_A`, etc.)
+- `experimental_runs`: experiment metadata (`cell_id`, `start_time_ts_utc`, `end_time_ts_utc`, `profile`, `environment`)
+- `experimental_timeseries`: cleaned experiment data (`test_time_s`, `cycle`, `step`, `current`, `voltage`, `temperature_c`)
+- `parameter_sets`: base set name + `name_extention` + `modified_parameters_json` + default flag
+- `simulation_runs`: simulation metadata per cell, parameter set, and model (`model_name`, `capacity_ah`, `initial_soc`)
+- `simulation_timeseries`: simulated data (`test_time_s`, `cycle`, `step`, `current`, `voltage`, `temperature_c`)
+- `comparison_metrics` (optional): summary metrics like RMSE
+
+Deliverables:
+
+- `phase3_database_schema.sql` (DDL schema definition)
+
+Relationship map (simple):
+
+- `cells (1) -> (N) experimental_runs`
+- `experimental_runs (1) -> (N) experimental_timeseries`
+- `cells (1) -> (N) simulation_runs`
+- `parameter_sets (1) -> (N) simulation_runs`
+- `simulation_runs (1) -> (N) simulation_timeseries`
+- `simulation_runs (1) -> (N) comparison_metrics`
+
+How this supports the required queries:
+
+1. all cycles for `CELL_A`: `cells` + `experimental_runs` + `experimental_timeseries`
+2. compare simulation vs experiment for cycle 2: `experimental_runs` + `experimental_timeseries` + `simulation_runs` + `simulation_timeseries`
+3. list parameter sets used with DFN: `simulation_runs` filtered by `model_name = 'DFN'` + `parameter_sets`
+4. show SPMe default voltage curves for all cells: `simulation_runs` (`SPMe`) + `parameter_sets` (`is_default=1`) + `simulation_timeseries`
 
 ---
 
