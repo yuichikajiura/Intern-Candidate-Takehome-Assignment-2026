@@ -262,30 +262,28 @@ Tables:
 - `cells`: cell master (`CELL_A`, etc.)
 - `experimental_runs`: experiment metadata (`cell_id`, `start_time_ts_utc`, `end_time_ts_utc`, `profile`, `environment`)
 - `experimental_timeseries`: cleaned experiment data (`test_time_s`, `cycle`, `step`, `current`, `voltage`)
-- `parameter_sets`: base set name + `name_extention` + `modified_parameters_json` + default flag
+- `parameter_sets`: base set name + `name_extention` + `modified_parameters_json` + `base_parameters_json`
 - `simulation_runs`: simulation metadata per cell, parameter set, and model (`model_name`, `capacity_ah`, `initial_soc`)
 - `simulation_timeseries`: simulated data (`test_time_s`, `cycle`, `step`, `current`, `voltage`)
-- `comparison_metrics` (optional): summary metrics like RMSE
 
 Deliverables:
 
 - `phase3_database_schema.sql` (DDL schema definition)
 
-Relationship map (simple):
+Relationship map:
 
 - `cells (1) -> (N) experimental_runs`
-- `experimental_runs (1) -> (N) experimental_timeseries`
+- `experimental_runs (1) -> (1) experimental_timeseries`
 - `cells (1) -> (N) simulation_runs`
 - `parameter_sets (1) -> (N) simulation_runs`
-- `simulation_runs (1) -> (N) simulation_timeseries`
-- `simulation_runs (1) -> (N) comparison_metrics`
+- `simulation_runs (1) -> (1) simulation_timeseries`
 
 How this supports the required queries:
 
 1. all cycles for `CELL_A`: `cells` + `experimental_runs` + `experimental_timeseries`
 2. compare simulation vs experiment for cycle 2: `experimental_runs` + `experimental_timeseries` + `simulation_runs` + `simulation_timeseries`
 3. list parameter sets used with DFN: `simulation_runs` filtered by `model_name = 'DFN'` + `parameter_sets`
-4. show SPMe default voltage curves for all cells: `simulation_runs` (`SPMe`) + `parameter_sets` (`is_default=1`) + `simulation_timeseries`
+4. show SPMe default voltage curves for all cells: `simulation_runs` (`SPMe`) + `cells.default_parameter_set_id` + `parameter_sets` + `simulation_timeseries`
 
 ---
 
@@ -351,11 +349,11 @@ python phase4_database_population.py \
 ```
 
 Use `--replace-existing-simulation` only when you want to overwrite simulation runs matching `(cell, model, parameter_set, name_extention, run_name)`.
-When `--parameter-name-extention ""` (default parameter set), selected `cells.default_parameter_set_id` is set to `1`.
+When `--parameter-name-extention ""` (default parameter set), `cells.default_parameter_set_id` is assigned to the resolved default parameter-set row for each selected cell.
 
 ### Phase 4 visualization implementation in this repo
 
-`phase4_plot_from_db.py` is a decoupled DB-only plotting script.
+`phase4_plot_from_db.py` is the DB-backed visualization/query script.
 - Optional cycle filtering via `--cycle` (single cycle or consecutive range, e.g., `1-2`)
 - Optional stacked current subplot via `--plot-with-current`
 - With `--plot-with-current`, the current subplot includes a secondary C-rate axis
@@ -364,6 +362,9 @@ When `--parameter-name-extention ""` (default parameter set), selected `cells.de
 - When multiple cells are selected, each cell is drawn in separate subplot panels
 - Supports multi-value filters via `--models` and `--parameter-sets`
 - By default, omitted filters mean "all" (all cells/models/parameter sets/run names)
+- Curve selection mode via `--series-mode {both,experiment-only,simulation-only}`
+- Parameter-set listing mode via `--list-parameters`
+- Default parameter-set inspection via `--show-default-parameter-set`
 
 #### Minimal usage (one simulation run id)
 
@@ -405,7 +406,7 @@ python phase4_plot_from_db.py \
 
 #### Plot SPMe + default parameters for all cells
 
-Default parameters are treated as `parameter_sets.name_extention = ''`.
+Default parameter sets are cell-specific via `cells.default_parameter_set_id`.
 
 ```bash
 python phase4_plot_from_db.py \
@@ -415,6 +416,60 @@ python phase4_plot_from_db.py \
 ```
 
 Output files are written to `outputs/phase4/` by default.
+
+### Commands for the 4 required query patterns
+
+Use `phase4_plot_from_db.py` as the DB-backed consumer for each pattern below.
+
+#### 1) "Show all cycles for CELL_A"
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cells CELL_A \
+  --series-mode experiment-only
+```
+
+#### 2) "Compare simulation vs experiment for cycle 2"
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cycle 2
+```
+
+Optionally scope to one cell/model:
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cells CELL_A \
+  --models SPMe \
+  --cycle 2
+```
+
+#### 3) "List all parameter sets used with the DFN model"
+
+Use this command to explicitly list DFN parameter sets:
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --models DFN \
+  --list-parameters
+```
+
+#### 4) "Show voltage curves for all cells simulated using SPMe model with default parameters"
+
+Default parameter sets are cell-specific via `cells.default_parameter_set_id`.
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --models SPMe \
+  --default-parameters-only \
+  --show-default-parameter-set
+```
 
 ---
 

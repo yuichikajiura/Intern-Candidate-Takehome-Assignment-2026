@@ -38,6 +38,7 @@ CREATE TABLE parameter_sets (
     base_parameter_set_name TEXT NOT NULL,  -- e.g., Chen2020
     name_extention TEXT NOT NULL DEFAULT '', -- e.g., "_tuned_v1"
     modified_parameters_json TEXT NOT NULL DEFAULT '{}',
+    base_parameters_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE (base_parameter_set_name, name_extention)
 );
 
@@ -48,6 +49,7 @@ CREATE TABLE simulation_runs (
     model_name TEXT NOT NULL,               -- SPM, SPMe, DFN
     capacity_ah REAL,                    -- run-specific config
     initial_soc REAL,                    -- run-specific config
+    parameter_overrides_json TEXT NOT NULL DEFAULT '{}', -- effective run-time overrides
     run_name TEXT,                       -- optional label
     FOREIGN KEY (cell_id) REFERENCES cells(id) ON DELETE CASCADE,
     FOREIGN KEY (parameter_set_id) REFERENCES parameter_sets(id) ON DELETE RESTRICT

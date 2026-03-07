@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pybamm
 
 from phase2_simulation import (
     determine_cells,
@@ -226,12 +227,114 @@ def load_modified_parameters_json(path: Path | None) -> str:
     return json.dumps(parsed, separators=(",", ":"), sort_keys=True)
 
 
+def parse_parameter_overrides(modified_parameters_json: str) -> dict[str, object]:
+    parsed = json.loads(modified_parameters_json)
+    if not isinstance(parsed, dict):
+        raise ValueError("modified_parameters_json must be a JSON object.")
+    out: dict[str, object] = {}
+    for key, value in parsed.items():
+        out[str(key)] = value
+    return out
+
+
+def ensure_simulation_run_parameter_overrides_column(conn: sqlite3.Connection) -> None:
+    table_info = conn.execute("PRAGMA table_info(simulation_runs);").fetchall()
+    column_names = {str(row[1]) for row in table_info}
+    if "parameter_overrides_json" in column_names:
+        return
+    conn.execute(
+        """
+        ALTER TABLE simulation_runs
+        ADD COLUMN parameter_overrides_json TEXT NOT NULL DEFAULT '{}';
+        """
+    )
+
+
+def _jsonify_param_value(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonify_param_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonify_param_value(v) for k, v in value.items()}
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return repr(value)
+
+
+def build_parameter_snapshots(
+    base_parameter_set_name: str,
+    modified_parameters_json: str,
+) -> tuple[str, str]:
+    overrides = parse_parameter_overrides(modified_parameters_json)
+    base_values = pybamm.ParameterValues(base_parameter_set_name)
+
+    base_dict = {
+        str(k): _jsonify_param_value(v)
+        for k, v in dict(base_values.items()).items()
+    }
+    overrides_json = json.dumps(overrides, separators=(",", ":"), sort_keys=True)
+    base_json = json.dumps(base_dict, separators=(",", ":"), sort_keys=True)
+    return base_json, overrides_json
+
+
+def ensure_parameter_set_storage_columns(conn: sqlite3.Connection) -> int:
+    table_info = conn.execute("PRAGMA table_info(parameter_sets);").fetchall()
+    column_names = {str(row[1]) for row in table_info}
+    if "base_parameters_json" not in column_names:
+        conn.execute(
+            """
+            ALTER TABLE parameter_sets
+            ADD COLUMN base_parameters_json TEXT NOT NULL DEFAULT '{}';
+            """
+        )
+
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            base_parameter_set_name,
+            modified_parameters_json
+        FROM parameter_sets;
+        """
+    ).fetchall()
+    for row in rows:
+        parameter_set_id = int(row[0])
+        base_name = str(row[1])
+        modified_json = str(row[2] or "{}")
+        base_json, normalized_overrides_json = build_parameter_snapshots(
+            base_parameter_set_name=base_name,
+            modified_parameters_json=modified_json,
+        )
+        conn.execute(
+            """
+            UPDATE parameter_sets
+            SET modified_parameters_json = ?,
+                base_parameters_json = ?
+            WHERE id = ?;
+            """,
+            (
+                normalized_overrides_json,
+                base_json,
+                parameter_set_id,
+            ),
+        )
+    return len(rows)
+
+
 def get_or_create_parameter_set_id(
     conn: sqlite3.Connection,
     base_parameter_set_name: str,
     name_extention: str,
     modified_parameters_json: str,
 ) -> int:
+    base_json, overrides_json = build_parameter_snapshots(
+        base_parameter_set_name=base_parameter_set_name,
+        modified_parameters_json=modified_parameters_json,
+    )
     row = conn.execute(
         """
         SELECT id
@@ -241,18 +344,34 @@ def get_or_create_parameter_set_id(
         (base_parameter_set_name, name_extention),
     ).fetchone()
     if row is not None:
-        return int(row[0])
+        parameter_set_id = int(row[0])
+        conn.execute(
+            """
+            UPDATE parameter_sets
+            SET modified_parameters_json = ?,
+                base_parameters_json = ?
+            WHERE id = ?;
+            """,
+            (overrides_json, base_json, parameter_set_id),
+        )
+        return parameter_set_id
 
     cur = conn.execute(
         """
         INSERT INTO parameter_sets (
             base_parameter_set_name,
             name_extention,
-            modified_parameters_json
+            modified_parameters_json,
+            base_parameters_json
         )
-        VALUES (?, ?, ?);
+        VALUES (?, ?, ?, ?);
         """,
-        (base_parameter_set_name, name_extention, modified_parameters_json),
+        (
+            base_parameter_set_name,
+            name_extention,
+            overrides_json,
+            base_json,
+        ),
     )
     return int(cur.lastrowid)
 
@@ -402,6 +521,7 @@ def populate_simulation_data(
     voltage_min: float | None,
     replace_existing_simulation: bool,
 ) -> None:
+    parameter_overrides = parse_parameter_overrides(modified_parameters_json)
     parameter_set_id = get_or_create_parameter_set_id(
         conn=conn,
         base_parameter_set_name=parameter_set,
@@ -432,6 +552,7 @@ def populate_simulation_data(
             voltage_max=voltage_max,
             voltage_min=voltage_min,
             save_files=False,
+            parameter_overrides=parameter_overrides,
         )
         summary_map = {
             str(row["cell_id"]): row for _, row in summary_df.iterrows()
@@ -461,9 +582,10 @@ def populate_simulation_data(
                     model_name,
                     capacity_ah,
                     initial_soc,
+                    parameter_overrides_json,
                     run_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     db_cell_id,
@@ -471,6 +593,7 @@ def populate_simulation_data(
                     model_name,
                     float(row["capacity_ah"]),
                     float(row["initial_soc"]),
+                    str(row.get("parameter_overrides_json", "{}")),
                     run_name,
                 ),
             )
@@ -534,6 +657,8 @@ def main() -> None:
     modified_parameters_json = load_modified_parameters_json(args.modified_parameters_json)
 
     with connect_db(args.db_path) as conn:
+        ensure_simulation_run_parameter_overrides_column(conn)
+        ensure_parameter_set_storage_columns(conn)
         if args.mode in ("full", "experimental-only"):
             print("Populating cleaned experimental data...")
             populate_experimental_data(

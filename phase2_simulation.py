@@ -190,7 +190,7 @@ def get_cell_initial_conditions(
 def apply_capacity_scaling(
     parameter_values: pybamm.ParameterValues,
     target_capacity_ah: float,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     base_nominal_capacity = float(parameter_values["Nominal cell capacity [A.h]"])
     if base_nominal_capacity <= 0:
         raise ValueError(f"Invalid base nominal capacity: {base_nominal_capacity}")
@@ -206,7 +206,20 @@ def apply_capacity_scaling(
         updates[parallel_key] = base_parallel * scale
 
     parameter_values.update(updates)
-    return scale
+    return scale, updates
+
+
+def resolve_effective_parameter_overrides(
+    parameter_set: str,
+    capacity_ah: float,
+    parameter_overrides: dict[str, float] | None = None,
+) -> dict[str, float]:
+    parameter_values = pybamm.ParameterValues(parameter_set)
+    _, capacity_updates = apply_capacity_scaling(parameter_values, float(capacity_ah))
+    resolved = dict(capacity_updates)
+    if parameter_overrides:
+        resolved.update({k: float(v) for k, v in parameter_overrides.items()})
+    return resolved
 
 
 def build_simulation(
@@ -257,6 +270,8 @@ def run_cell_simulation(
     solver_mode: str,
     voltage_max: float | None,
     voltage_min: float | None,
+    parameter_overrides: dict[str, float] | None = None,
+    verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, str, bool]:
     t_s = (cell_df["datetime"] - cell_df["datetime"].iloc[0]).dt.total_seconds().to_numpy()
     i_exp = cell_df["current_A"].to_numpy(dtype=float)
@@ -264,11 +279,13 @@ def run_cell_simulation(
 
     model = make_model(model_name, parameter_set=parameter_set)
     parameter_values = pybamm.ParameterValues(parameter_set)
-    capacity_scale = apply_capacity_scaling(parameter_values, float(capacity_ah))
+    capacity_scale, _ = apply_capacity_scaling(parameter_values, float(capacity_ah))
     if voltage_max is not None:
         parameter_values.update({"Upper voltage cut-off [V]": float(voltage_max)})
     if voltage_min is not None:
         parameter_values.update({"Lower voltage cut-off [V]": float(voltage_min)})
+    if parameter_overrides:
+        parameter_values.update({k: float(v) for k, v in parameter_overrides.items()})
 
     sim = build_simulation(model, parameter_values, t_s, i_exp, solver_mode)
     initial_soc_applied = True
@@ -279,11 +296,12 @@ def run_cell_simulation(
         # initial_soc path as non-composite sets. Retry without initial_soc.
         if "composite" not in parameter_set.lower():
             raise
-        print(
-            "Warning: initial_soc-based initialization failed for composite "
-            f"parameter set ({parameter_set}); falling back to parameter defaults. "
-            f"Original error: {exc}"
-        )
+        if verbose:
+            print(
+                "Warning: initial_soc-based initialization failed for composite "
+                f"parameter set ({parameter_set}); falling back to parameter defaults. "
+                f"Original error: {exc}"
+            )
         solution = sim.solve(t_eval=t_s)
         initial_soc_applied = False
     t_sim = np.asarray(solution["Time [s]"].entries, dtype=float)
@@ -418,6 +436,8 @@ def simulate_cells(
     voltage_max: float | None = None,
     voltage_min: float | None = None,
     save_files: bool = True,
+    parameter_overrides: dict[str, float] | None = None,
+    verbose: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     if save_files and output_dir is None:
         raise ValueError("output_dir must be provided when save_files=True")
@@ -440,10 +460,11 @@ def simulate_cells(
             fallback_initial_soc=fallback_initial_soc,
         )
 
-        print(
-            f"Simulating {cell_id}: model={model_name}, parameter_set={parameter_set}, "
-            f"capacity_ah={capacity_ah}, initial_soc={initial_soc}"
-        )
+        if verbose:
+            print(
+                f"Simulating {cell_id}: model={model_name}, parameter_set={parameter_set}, "
+                f"capacity_ah={capacity_ah}, initial_soc={initial_soc}"
+            )
         (
             t_s,
             i_exp,
@@ -462,10 +483,13 @@ def simulate_cells(
             solver_mode=solver_mode,
             voltage_max=voltage_max,
             voltage_min=voltage_min,
+            parameter_overrides=parameter_overrides,
+            verbose=verbose,
         )
-        print(f"{cell_id}: capacity scaling factor vs base set = {capacity_scale:.6f}")
+        if verbose:
+            print(f"{cell_id}: capacity scaling factor vs base set = {capacity_scale:.6f}")
 
-        # Strict mode: simulation must cover full profile. If not, save diagnostics then fail.
+        # Simulation must cover full profile. If not, save diagnostics then fail.
         if len(v_sim) != len(v_exp) or len(t_sim) != len(t_s) or not np.isclose(
             t_sim[-1], t_s[-1], atol=1e-8, rtol=0.0
         ):
@@ -507,6 +531,11 @@ def simulate_cells(
             )
 
         rmse = float(np.sqrt(np.mean((v_sim - v_exp) ** 2)))
+        effective_overrides = resolve_effective_parameter_overrides(
+            parameter_set=parameter_set,
+            capacity_ah=capacity_ah,
+            parameter_overrides=parameter_overrides,
+        )
         summary_rows.append(
             {
                 "cell_id": cell_id,
@@ -522,10 +551,14 @@ def simulate_cells(
                 "voltage_min": voltage_min,
                 "voltage_max": voltage_max,
                 "termination_reason": termination_reason,
+                "parameter_overrides_json": json.dumps(
+                    effective_overrides, separators=(",", ":"), sort_keys=True
+                ),
                 "rmse_V": rmse,
             }
         )
-        print(f"Completed {cell_id}: RMSE={rmse:.6f} V")
+        if verbose:
+            print(f"Completed {cell_id}: RMSE={rmse:.6f} V")
 
     return pd.DataFrame(summary_rows), comparison_by_cell
 
@@ -554,13 +587,14 @@ def main() -> None:
             fallback_capacity_ah=args.capacity_ah,
             fallback_initial_soc=args.initial_soc,
             output_dir=args.output_dir,
-        max_cycle=args.max_cycle,
+            max_cycle=args.max_cycle,
             model_name=args.model_name,
             parameter_set=args.parameter_set,
             solver_mode=args.solver_mode,
             voltage_max=args.voltage_max,
             voltage_min=args.voltage_min,
             save_files=True,
+            verbose=True,
         )
     except KeyboardInterrupt:
         print(
