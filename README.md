@@ -103,12 +103,13 @@ Key output files:
 
 - Input: `data/phase1_cleaned_data.csv` (uses `datetime`, `cell_id`, `cycle`, `step`, `current_A`, `voltage_V`)
 - Model selection: `SPM`, `SPMe`, or `DFN` (`--model-name`, default `SPMe`)
-- Parameter set: `Chen2020` (composite support removed)
+- Parameter set: selectable PyBaMM set name via `--parameter-set` (for example, `Chen2020` or `Chen2020_composite`)
 - Capacity handling: `capacity_ah` is applied to nominal capacity and used to scale parallel-electrode count so capacity impacts current-driven dynamics
 - Reusable API for Phase 4:
   - `make_comparison_df(...)` builds per-cell simulation-vs-experiment DataFrame
   - `simulate_cells(...)` returns `(summary_df, comparison_by_cell)` and can skip file writes with `save_files=False`
 - Summary metadata includes model/config fields (`model_name`, `solver_mode`, `voltage_min`, `voltage_max`) for DB insertion
+- For composite parameter sets (for example, `Chen2020_composite`), the script enables composite model options automatically and, if `initial_soc` initialization is not supported by PyBaMM, falls back to parameter-set default initial state while recording `initial_soc_applied=false` in summary output.
 - Outputs on successful completion:
   - per cell: `outputs/phase2/<CELL>_comparison.csv`, `outputs/phase2/<CELL>_voltage_compare.png`
   - global: `outputs/phase2/simulation_summary.csv` with RMSE by cell and run metadata
@@ -260,10 +261,10 @@ Tables:
 
 - `cells`: cell master (`CELL_A`, etc.)
 - `experimental_runs`: experiment metadata (`cell_id`, `start_time_ts_utc`, `end_time_ts_utc`, `profile`, `environment`)
-- `experimental_timeseries`: cleaned experiment data (`test_time_s`, `cycle`, `step`, `current`, `voltage`, `temperature_c`)
+- `experimental_timeseries`: cleaned experiment data (`test_time_s`, `cycle`, `step`, `current`, `voltage`)
 - `parameter_sets`: base set name + `name_extention` + `modified_parameters_json` + default flag
 - `simulation_runs`: simulation metadata per cell, parameter set, and model (`model_name`, `capacity_ah`, `initial_soc`)
-- `simulation_timeseries`: simulated data (`test_time_s`, `cycle`, `step`, `current`, `voltage`, `temperature_c`)
+- `simulation_timeseries`: simulated data (`test_time_s`, `cycle`, `step`, `current`, `voltage`)
 - `comparison_metrics` (optional): summary metrics like RMSE
 
 Deliverables:
@@ -303,6 +304,117 @@ How this supports the required queries:
    - Reads from the database
    - Plots experimental vs simulated curves
    - Can be run independently
+
+### Phase 4 database population implementation in this repo
+
+`phase4_database_population.py` populates the SQLite database defined by `phase3_database_schema.sql`.
+
+- Experimental source: `data/phase1_cleaned_data.csv` (cleaned Phase 1 output)
+- Simulation source/config:
+  - current profile replay from cleaned data
+  - per-cell `capacity_ah` and `initial_soc` from `data/phase2_cell_config.json`
+  - supports multiple models in one run (default: `SPM` and `SPMe`)
+- Population modes:
+  - `full`: insert experimental + simulation
+  - `experimental-only`: insert only cleaned experimental data
+  - `simulation-only`: insert only simulation data (useful for incremental appends later, e.g., optimized parameter sets)
+
+#### Full population (cleaned experiment + SPM/SPMe simulation)
+
+```bash
+python phase4_database_population.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --schema-sql-path phase3_database_schema.sql \
+  --cleaned-csv-path data/phase1_cleaned_data.csv \
+  --cell-config-json data/phase2_cell_config.json \
+  --mode full \
+  --models SPM SPMe \
+  --parameter-set Chen2020 \
+  --recreate-db
+```
+
+#### Simulation-only append (additional runs later)
+
+Example for appending optimized-parameter simulation runs without touching experimental rows:
+
+```bash
+python phase4_database_population.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cleaned-csv-path data/phase1_cleaned_data.csv \
+  --cell-config-json data/phase2_cell_config.json \
+  --mode simulation-only \
+  --models SPM SPMe \
+  --parameter-set Chen2020 \
+  --parameter-name-extention "_optimized_v1" \
+  --modified-parameters-json data/optimized_params_v1.json \
+  --run-name optimized_v1
+```
+
+Use `--replace-existing-simulation` only when you want to overwrite simulation runs matching `(cell, model, parameter_set, name_extention, run_name)`.
+When `--parameter-name-extention ""` (default parameter set), selected `cells.default_parameter_set_id` is set to `1`.
+
+### Phase 4 visualization implementation in this repo
+
+`phase4_plot_from_db.py` is a decoupled DB-only plotting script.
+- Optional cycle filtering via `--cycle` (single cycle or consecutive range, e.g., `1-2`)
+- Optional stacked current subplot via `--plot-with-current`
+- With `--plot-with-current`, the current subplot includes a secondary C-rate axis
+  computed as current divided by `simulation_runs.capacity_ah`
+- Supports plotting multiple simulation runs and multiple cells in one figure
+- When multiple cells are selected, each cell is drawn in separate subplot panels
+- Supports multi-value filters via `--models` and `--parameter-sets`
+- By default, omitted filters mean "all" (all cells/models/parameter sets/run names)
+
+#### Minimal usage (one simulation run id)
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --simulation-run-ids 1
+```
+
+#### Plot selected cells with multiple models in one figure
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cells CELL_A CELL_B \
+  --models SPM SPMe \
+  --parameter-sets Chen2020
+```
+
+#### Plot explicit simulation run ids together
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --simulation-run-ids 1 3 8
+```
+
+#### Plot cycle range (1-2) with current
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --cells CELL_A CELL_B \
+  --models SPMe \
+  --parameter-sets Chen2020 \
+  --cycle 1-2 \
+  --plot-with-current
+```
+
+#### Plot SPMe + default parameters for all cells
+
+Default parameters are treated as `parameter_sets.name_extention = ''`.
+
+```bash
+python phase4_plot_from_db.py \
+  --db-path outputs/phase4/battery_pipeline.db \
+  --models SPMe \
+  --default-parameters-only
+```
+
+Output files are written to `outputs/phase4/` by default.
 
 ---
 

@@ -75,9 +75,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parameter-set",
-        choices=["Chen2020"],
         default="Chen2020",
-        help="PyBaMM parameter set.",
+        help="PyBaMM parameter set name (e.g., Chen2020, Chen2020_composite).",
     )
     parser.add_argument(
         "--solver-mode",
@@ -223,7 +222,7 @@ def build_simulation(
     return pybamm.Simulation(model=model, parameter_values=parameter_values, solver=solver)
 
 
-def make_model(model_name: str) -> pybamm.BaseModel:
+def make_model(model_name: str, parameter_set: str | None = None) -> pybamm.BaseModel:
     model_builders: dict[str, object] = {
         "SPM": pybamm.lithium_ion.SPM,
         "SPMe": pybamm.lithium_ion.SPMe,
@@ -233,7 +232,20 @@ def make_model(model_name: str) -> pybamm.BaseModel:
         raise ValueError(f"Unsupported model_name: {model_name}")
 
     builder = model_builders[model_name]
+    # Composite parameter sets (e.g., Chen2020_composite) require multi-phase
+    # negative electrode options in the model definition.
+    if parameter_set is not None and "composite" in parameter_set.lower():
+        return builder(options={"particle phases": ("2", "1")})
     return builder()
+
+
+def validate_parameter_set_name(parameter_set: str) -> None:
+    try:
+        pybamm.ParameterValues(parameter_set)
+    except Exception as exc:
+        raise ValueError(
+            f"Unknown or unsupported PyBaMM parameter set: {parameter_set}"
+        ) from exc
 
 
 def run_cell_simulation(
@@ -245,12 +257,12 @@ def run_cell_simulation(
     solver_mode: str,
     voltage_max: float | None,
     voltage_min: float | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, str]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, str, bool]:
     t_s = (cell_df["datetime"] - cell_df["datetime"].iloc[0]).dt.total_seconds().to_numpy()
     i_exp = cell_df["current_A"].to_numpy(dtype=float)
     v_exp = cell_df["voltage_V"].to_numpy(dtype=float)
 
-    model = make_model(model_name)
+    model = make_model(model_name, parameter_set=parameter_set)
     parameter_values = pybamm.ParameterValues(parameter_set)
     capacity_scale = apply_capacity_scaling(parameter_values, float(capacity_ah))
     if voltage_max is not None:
@@ -259,12 +271,35 @@ def run_cell_simulation(
         parameter_values.update({"Lower voltage cut-off [V]": float(voltage_min)})
 
     sim = build_simulation(model, parameter_values, t_s, i_exp, solver_mode)
-    solution = sim.solve(t_eval=t_s, initial_soc=float(initial_soc))
+    initial_soc_applied = True
+    try:
+        solution = sim.solve(t_eval=t_s, initial_soc=float(initial_soc))
+    except Exception as exc:
+        # Composite parameter sets may not support the same eSOH-based
+        # initial_soc path as non-composite sets. Retry without initial_soc.
+        if "composite" not in parameter_set.lower():
+            raise
+        print(
+            "Warning: initial_soc-based initialization failed for composite "
+            f"parameter set ({parameter_set}); falling back to parameter defaults. "
+            f"Original error: {exc}"
+        )
+        solution = sim.solve(t_eval=t_s)
+        initial_soc_applied = False
     t_sim = np.asarray(solution["Time [s]"].entries, dtype=float)
     v_sim = solution["Terminal voltage [V]"].entries
     v_sim = np.asarray(v_sim, dtype=float)
     termination_reason = str(getattr(solution, "termination", "unknown"))
-    return t_s, i_exp, v_exp, t_sim, v_sim, capacity_scale, termination_reason
+    return (
+        t_s,
+        i_exp,
+        v_exp,
+        t_sim,
+        v_sim,
+        capacity_scale,
+        termination_reason,
+        initial_soc_applied,
+    )
 
 
 def save_voltage_compare_plot(
@@ -375,7 +410,7 @@ def simulate_cells(
     config_map: dict[str, dict[str, float]],
     fallback_capacity_ah: float | None,
     fallback_initial_soc: float | None,
-    output_dir: Path,
+    output_dir: Path | None = None,
     max_cycle: float | None = None,
     model_name: str = DEFAULT_MODEL_NAME,
     parameter_set: str = "Chen2020",
@@ -384,6 +419,9 @@ def simulate_cells(
     voltage_min: float | None = None,
     save_files: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    if save_files and output_dir is None:
+        raise ValueError("output_dir must be provided when save_files=True")
+
     summary_rows: list[dict[str, object]] = []
     comparison_by_cell: dict[str, pd.DataFrame] = {}
 
@@ -406,7 +444,16 @@ def simulate_cells(
             f"Simulating {cell_id}: model={model_name}, parameter_set={parameter_set}, "
             f"capacity_ah={capacity_ah}, initial_soc={initial_soc}"
         )
-        t_s, i_exp, v_exp, t_sim, v_sim, capacity_scale, termination_reason = run_cell_simulation(
+        (
+            t_s,
+            i_exp,
+            v_exp,
+            t_sim,
+            v_sim,
+            capacity_scale,
+            termination_reason,
+            initial_soc_applied,
+        ) = run_cell_simulation(
             cell_df=cell_df,
             model_name=model_name,
             parameter_set=parameter_set,
@@ -422,7 +469,7 @@ def simulate_cells(
         if len(v_sim) != len(v_exp) or len(t_sim) != len(t_s) or not np.isclose(
             t_sim[-1], t_s[-1], atol=1e-8, rtol=0.0
         ):
-            if save_files:
+            if save_files and output_dir is not None:
                 save_early_termination_diagnostics(
                     cell_id=cell_id,
                     model_name=model_name,
@@ -448,7 +495,7 @@ def simulate_cells(
             v_sim=v_sim,
         )
         comparison_by_cell[cell_id] = comparison_df
-        if save_files:
+        if save_files and output_dir is not None:
             save_outputs(
                 cell_id=cell_id,
                 model_name=model_name,
@@ -467,6 +514,7 @@ def simulate_cells(
                 "parameter_set": parameter_set,
                 "capacity_ah": capacity_ah,
                 "initial_soc": initial_soc,
+                "initial_soc_applied": initial_soc_applied,
                 "max_cycle_requested": max_cycle,
                 "max_cycle_included": float(cell_df["cycle"].max()),
                 "capacity_scale": capacity_scale,
@@ -484,6 +532,7 @@ def simulate_cells(
 
 def main() -> None:
     args = parse_args()
+    validate_parameter_set_name(args.parameter_set)
     df = read_and_prepare_data(args.input_csv)
     config_map = load_cell_config(args.cell_config_json)
     cells = determine_cells(df, args.cells, config_map)

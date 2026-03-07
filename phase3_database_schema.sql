@@ -27,7 +27,6 @@ CREATE TABLE experimental_timeseries (
     step_index INTEGER NOT NULL,
     current_a REAL,
     voltage_v REAL,
-    temperature_c REAL,
     FOREIGN KEY (experimental_run_id) REFERENCES experimental_runs(id) ON DELETE CASCADE
 );
 
@@ -62,7 +61,6 @@ CREATE TABLE simulation_timeseries (
     step_index INTEGER,
     current_a REAL,
     voltage_v REAL,
-    temperature_c REAL,
     FOREIGN KEY (simulation_run_id) REFERENCES simulation_runs(id) ON DELETE CASCADE
 );
 

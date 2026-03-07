@@ -41,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parameter-set",
-        choices=["Chen2020"],
         default="Chen2020",
+        help="PyBaMM parameter set name (e.g., Chen2020, Chen2020_composite).",
     )
     parser.add_argument("--solver-mode", choices=["safe", "fast"], default="safe")
     parser.add_argument("--soc-lower", type=float, default=0.01)
