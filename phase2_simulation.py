@@ -209,16 +209,65 @@ def apply_capacity_scaling(
     return scale, updates
 
 
+def _is_numeric_scalar(value: object) -> bool:
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return True
+    if hasattr(value, "item"):
+        try:
+            _ = value.item()
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _scaled_parameter_value(base_value: object, scale: float) -> object:
+    if callable(base_value):
+        def wrapped(*args: object, _base=base_value, _scale=float(scale)) -> object:
+            return _scale * _base(*args)
+
+        return wrapped
+    if _is_numeric_scalar(base_value):
+        scalar = base_value.item() if hasattr(base_value, "item") else base_value
+        return float(scale) * float(scalar)
+    raise ValueError(
+        "Unsupported parameter type for scaling override. "
+        f"type={type(base_value).__name__}"
+    )
+
+
+def apply_parameter_overrides(
+    parameter_values: pybamm.ParameterValues,
+    parameter_overrides: dict[str, object] | None,
+) -> None:
+    if not parameter_overrides:
+        return
+    updates: dict[str, object] = {}
+    for key, value in parameter_overrides.items():
+        if isinstance(value, dict) and value.get("mode") == "scale":
+            if "value" not in value:
+                raise ValueError(
+                    f"Scaling override for '{key}' must include numeric 'value'."
+                )
+            updates[str(key)] = _scaled_parameter_value(
+                base_value=parameter_values[str(key)],
+                scale=float(value["value"]),
+            )
+            continue
+        updates[str(key)] = float(value)
+    parameter_values.update(updates)
+
+
 def resolve_effective_parameter_overrides(
     parameter_set: str,
     capacity_ah: float,
-    parameter_overrides: dict[str, float] | None = None,
-) -> dict[str, float]:
+    parameter_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
     parameter_values = pybamm.ParameterValues(parameter_set)
     _, capacity_updates = apply_capacity_scaling(parameter_values, float(capacity_ah))
     resolved = dict(capacity_updates)
     if parameter_overrides:
-        resolved.update({k: float(v) for k, v in parameter_overrides.items()})
+        resolved.update(parameter_overrides)
     return resolved
 
 
@@ -270,7 +319,7 @@ def run_cell_simulation(
     solver_mode: str,
     voltage_max: float | None,
     voltage_min: float | None,
-    parameter_overrides: dict[str, float] | None = None,
+    parameter_overrides: dict[str, object] | None = None,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, str, bool]:
     t_s = (cell_df["datetime"] - cell_df["datetime"].iloc[0]).dt.total_seconds().to_numpy()
@@ -284,8 +333,10 @@ def run_cell_simulation(
         parameter_values.update({"Upper voltage cut-off [V]": float(voltage_max)})
     if voltage_min is not None:
         parameter_values.update({"Lower voltage cut-off [V]": float(voltage_min)})
-    if parameter_overrides:
-        parameter_values.update({k: float(v) for k, v in parameter_overrides.items()})
+    apply_parameter_overrides(
+        parameter_values=parameter_values,
+        parameter_overrides=parameter_overrides,
+    )
 
     sim = build_simulation(model, parameter_values, t_s, i_exp, solver_mode)
     initial_soc_applied = True
@@ -436,7 +487,7 @@ def simulate_cells(
     voltage_max: float | None = None,
     voltage_min: float | None = None,
     save_files: bool = True,
-    parameter_overrides: dict[str, float] | None = None,
+    parameter_overrides: dict[str, object] | None = None,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     if save_files and output_dir is None:

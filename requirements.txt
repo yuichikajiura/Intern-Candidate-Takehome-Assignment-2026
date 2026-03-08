@@ -4,3 +4,4 @@ numpy
 pandas
 matplotlib
 pybamm>=25.12.2
+scipy

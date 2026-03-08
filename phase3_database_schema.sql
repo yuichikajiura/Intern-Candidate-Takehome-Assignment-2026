@@ -52,7 +52,8 @@ CREATE TABLE simulation_runs (
     parameter_overrides_json TEXT NOT NULL DEFAULT '{}', -- effective run-time overrides
     run_name TEXT,                       -- optional label
     FOREIGN KEY (cell_id) REFERENCES cells(id) ON DELETE CASCADE,
-    FOREIGN KEY (parameter_set_id) REFERENCES parameter_sets(id) ON DELETE RESTRICT
+    FOREIGN KEY (parameter_set_id) REFERENCES parameter_sets(id) ON DELETE RESTRICT,
+    UNIQUE (cell_id, model_name, parameter_set_id, run_name)
 );
 
 CREATE TABLE simulation_timeseries (
@@ -68,3 +69,15 @@ CREATE TABLE simulation_timeseries (
 
 CREATE INDEX idx_sim_run_cycle_step
     ON simulation_timeseries (simulation_run_id, cycle_index, step_index);
+
+CREATE TABLE optimization_runs (
+    id INTEGER PRIMARY KEY,
+    simulation_run_id INTEGER NOT NULL UNIQUE,
+    base_simulation_run_id INTEGER,
+    created_at_ts_utc TEXT NOT NULL,
+    objective_v REAL,
+    optimization_config_json TEXT NOT NULL DEFAULT '{}',
+    best_result_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (simulation_run_id) REFERENCES simulation_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (base_simulation_run_id) REFERENCES simulation_runs(id) ON DELETE SET NULL
+);

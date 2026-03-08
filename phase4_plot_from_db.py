@@ -113,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print default parameter set (base + overridden) for matching/all cells.",
     )
+    parser.add_argument(
+        "--list-optimization-runs",
+        action="store_true",
+        help=(
+            "List optimization metadata for matching simulation runs (from "
+            "optimization_runs table) and exit."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -362,6 +370,75 @@ def show_default_parameter_sets(
         print_parameter_set_rows("Default parameter set by cell:", present_rows)
     for cell_code in missing:
         print(f"- {cell_code}: <not set>")
+
+
+def list_optimization_runs_for_selection(
+    conn: sqlite3.Connection,
+    runs: list[SimulationRunMeta],
+) -> None:
+    run_ids = sorted({run.simulation_run_id for run in runs})
+    if not run_ids:
+        print("No matching simulation runs.")
+        return
+    placeholders = ",".join(["?"] * len(run_ids))
+    rows = conn.execute(
+        f"""
+        SELECT
+            sr.id,
+            c.cell_code,
+            sr.model_name,
+            ps.base_parameter_set_name,
+            ps.name_extention,
+            sr.run_name,
+            oru.base_simulation_run_id,
+            oru.created_at_ts_utc,
+            oru.objective_v,
+            oru.optimization_config_json
+        FROM optimization_runs oru
+        JOIN simulation_runs sr ON sr.id = oru.simulation_run_id
+        JOIN cells c ON c.id = sr.cell_id
+        JOIN parameter_sets ps ON ps.id = sr.parameter_set_id
+        WHERE sr.id IN ({placeholders})
+        ORDER BY sr.id ASC;
+        """,
+        run_ids,
+    ).fetchall()
+    if not rows:
+        print("No optimization metadata rows found for selected simulation runs.")
+        return
+    print("Optimization runs:")
+    for row in rows:
+        (
+            run_id,
+            cell_code,
+            model_name,
+            base_set,
+            name_ext,
+            run_name,
+            base_run_id,
+            created_at,
+            objective_v,
+            config_json,
+        ) = row
+        print(
+            f"- run_id={run_id}, cell={cell_code}, model={model_name}, "
+            f"base_set={base_set}, name_extention='{name_ext}', run_name={run_name}, "
+            f"base_run_id={base_run_id}, objective_v={objective_v}, created_at={created_at}"
+        )
+        try:
+            parsed = json.loads(str(config_json or "{}"))
+        except Exception:
+            print(f"  optimization_config_json={config_json}")
+            continue
+        if not isinstance(parsed, dict):
+            print(f"  optimization_config_json={config_json}")
+            continue
+        cycle_value = parsed.get("cycle", None)
+        requested_ext = parsed.get("db_parameter_name_extention_requested", None)
+        resolved_ext = parsed.get("db_parameter_name_extention_resolved", None)
+        print(
+            f"  cycle={cycle_value}, ext_requested={requested_ext}, ext_resolved={resolved_ext}"
+        )
 
 
 def parse_cycle_range(cycle_arg: str | None) -> tuple[int, int] | None:
@@ -698,10 +775,23 @@ def main() -> None:
         if args.show_default_parameter_set:
             show_default_parameter_sets(conn, args.cells)
 
-        if args.series_mode in ("both", "simulation-only") or args.list_parameters:
+        if (
+            args.series_mode in ("both", "simulation-only")
+            or args.list_parameters
+            or args.list_optimization_runs
+        ):
             runs = resolve_simulation_runs(conn, args)
             if args.list_parameters:
                 list_parameter_sets_used_by_runs(conn, runs)
+                return
+            if args.list_optimization_runs:
+                try:
+                    list_optimization_runs_for_selection(conn, runs)
+                except sqlite3.OperationalError:
+                    print(
+                        "optimization_runs table is not present in this DB yet. "
+                        "Run phase5_run_optimization.py at least once to record metadata."
+                    )
                 return
         else:
             runs = []

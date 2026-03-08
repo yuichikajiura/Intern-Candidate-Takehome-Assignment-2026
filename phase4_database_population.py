@@ -250,6 +250,50 @@ def ensure_simulation_run_parameter_overrides_column(conn: sqlite3.Connection) -
     )
 
 
+def ensure_simulation_run_name_uniqueness(conn: sqlite3.Connection) -> None:
+    duplicate_rows = conn.execute(
+        """
+        SELECT
+            c.cell_code,
+            sr.model_name,
+            ps.base_parameter_set_name,
+            ps.name_extention,
+            sr.run_name,
+            COUNT(*) AS n
+        FROM simulation_runs sr
+        JOIN cells c ON c.id = sr.cell_id
+        JOIN parameter_sets ps ON ps.id = sr.parameter_set_id
+        WHERE sr.run_name IS NOT NULL
+        GROUP BY sr.cell_id, sr.model_name, sr.parameter_set_id, sr.run_name
+        HAVING COUNT(*) > 1
+        ORDER BY n DESC, sr.run_name ASC
+        LIMIT 5;
+        """
+    ).fetchall()
+    if duplicate_rows:
+        examples = [
+            (
+                f"(cell={row[0]}, model={row[1]}, base_set={row[2]}, "
+                f"name_extention={row[3]}, run_name={row[4]}, count={row[5]})"
+            )
+            for row in duplicate_rows
+        ]
+        raise RuntimeError(
+            "Duplicate simulation run_name groups exist for the same "
+            "(cell, model, parameter_set, run_name). "
+            "Please clean duplicates before enabling uniqueness index. "
+            f"Examples: {examples}"
+        )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_runs_unique_scope
+        ON simulation_runs (cell_id, model_name, parameter_set_id, run_name)
+        WHERE run_name IS NOT NULL;
+        """
+    )
+
+
 def _jsonify_param_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -658,6 +702,7 @@ def main() -> None:
 
     with connect_db(args.db_path) as conn:
         ensure_simulation_run_parameter_overrides_column(conn)
+        ensure_simulation_run_name_uniqueness(conn)
         ensure_parameter_set_storage_columns(conn)
         if args.mode in ("full", "experimental-only"):
             print("Populating cleaned experimental data...")
