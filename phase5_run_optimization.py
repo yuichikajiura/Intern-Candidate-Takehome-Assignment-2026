@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from phase5_cached_runner import build_cached_runner, solve_with_inputs
 from phase5_common import (
@@ -18,7 +17,6 @@ from phase5_common import (
     OHMIC_CANDIDATES,
     REACTION_CANDIDATES,
     SELECTOR_CHOICES,
-    apply_scaled_override,
     build_rmse_weights,
     filter_cell_cycles,
     parameter_name_from_selector,

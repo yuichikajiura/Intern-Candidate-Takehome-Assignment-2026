@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show the plot interactively instead of only saving PNG.",
+    )
+    parser.add_argument(
         "--db-path",
         type=Path,
         default=DEFAULT_DB_PATH,
@@ -610,11 +615,13 @@ def plot_comparison(
     aligned_series: list[tuple[SimulationRunMeta, pd.DataFrame]],
     exp_by_cell: dict[str, pd.DataFrame],
     cycle_range: tuple[int, int] | None,
-    output_path: Path,
+    output_path: Path | None,
     plot_current_above_voltage: bool,
     series_mode: str,
+    show: bool,
 ) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     cells_from_sim = {meta.cell_code for meta, _ in aligned_series}
     cells_sorted = sorted(set(exp_by_cell.keys()) | cells_from_sim)
     if not cells_sorted:
@@ -759,9 +766,14 @@ def plot_comparison(
             ax_v.legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
 
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150)
+
+    if show:
+        plt.show()
+
+    plt.close(fig)
 
 def main() -> None:
     args = parse_args()
@@ -848,13 +860,14 @@ def main() -> None:
             set(exp_by_cell.keys()) | {meta.cell_code for meta, _ in aligned_series}
         )
         run_ids_for_output = [m.simulation_run_id for m in runs]
-        out_path = build_output_path(
+        out_path = None if args.show else build_output_path(
             output_dir=args.output_dir,
             has_current=args.plot_with_current,
             run_ids=run_ids_for_output,
             cell_codes=cell_codes_for_output,
             cycle_range=cycle_range,
         )
+
         plot_comparison(
             aligned_series=aligned_series,
             exp_by_cell=exp_by_cell,
@@ -862,13 +875,21 @@ def main() -> None:
             output_path=out_path,
             plot_current_above_voltage=args.plot_with_current,
             series_mode=args.series_mode,
-        )
-        print(
-            f"Saved plot: {out_path} "
-            f"(mode={args.series_mode}, cells={cell_codes_for_output}, "
-            f"runs={[m.simulation_run_id for m in runs]})"
+            show=args.show,
         )
 
+        if args.show:
+            print(
+                f"Displayed plot "
+                f"(mode={args.series_mode}, cells={cell_codes_for_output}, "
+                f"runs={[m.simulation_run_id for m in runs]})"
+            )
+        else:
+            print(
+                f"Saved plot: {out_path} "
+                f"(mode={args.series_mode}, cells={cell_codes_for_output}, "
+                f"runs={[m.simulation_run_id for m in runs]})"
+            )
 
 if __name__ == "__main__":
     main()

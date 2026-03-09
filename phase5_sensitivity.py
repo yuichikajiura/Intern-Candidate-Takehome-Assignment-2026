@@ -13,13 +13,9 @@ from phase5_common import (
     DIFFUSION_CANDIDATES,
     OHMIC_CANDIDATES,
     REACTION_CANDIDATES,
-    build_rmse_weights,
-    downsample_for_fitting,
     filter_cell_cycles,
-    parameter_name_from_selector,
     parse_cycle_range,
     prepare_base_parameter_context,
-    print_phase5_context,
     resolve_capacity_and_initial_soc,
     simulate_voltage_trace,
     validate_base_inputs,
@@ -28,14 +24,13 @@ from phase5_common import (
 
 INPUT_CSV_PATH = Path("data/phase1_cleaned_data.csv")
 OUTPUT_DIR = Path("outputs/phase5")
-SENSITIVITY_TAIL_DOWNSAMPLE_STRIDE = 60
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Phase 5 sensitivity-only runner: evaluate parameter sensitivity and save "
-            "window-RMSE tables plus voltage overlay plots."
+            "overall RMSE delta tables plus voltage overlay plots."
         )
     )
     parser.add_argument("--input-csv", type=Path, default=INPUT_CSV_PATH)
@@ -61,42 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voltage-max", type=float, default=4.5)
     parser.add_argument("--voltage-min", type=float, default=2.0)
     parser.add_argument(
-        "--ohmic-parameter",
-        choices=["n", "p", "e"],
-        default=None,
-        help="Ohmic selector when not scanning all candidates.",
-    )
-    parser.add_argument(
-        "--kinetic-parameter",
-        choices=["n", "p", "e"],
-        default=None,
-        help="Kinetic selector when not scanning all candidates (e is invalid).",
-    )
-    parser.add_argument(
-        "--diffusion-parameter",
-        choices=["n", "p", "e"],
-        default=None,
-        help="Diffusion selector when not scanning all candidates.",
-    )
-    parser.add_argument(
-        "--rmse-weights",
-        nargs=4,
-        type=float,
-        default=[1.0, 1.0, 1.0, 1.0],
-        metavar=("OHMIC", "KINETIC", "DIFFUSION", "CAPACITY"),
-        help="Weights for windowed delta-RMSE sensitivity score.",
-    )
-    parser.add_argument(
         "--sensitivity-scales",
         nargs="+",
         type=float,
-        default=[0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+        default=[0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 5.0],
         help="Multipliers used in one-at-a-time sensitivity scans.",
-    )
-    parser.add_argument(
-        "--sensitivity-include-all-candidates",
-        action="store_true",
-        help="Scan all fixed candidates in each category.",
     )
     return parser.parse_args()
 
@@ -130,89 +94,28 @@ def save_sensitivity_voltage_plot(
     plt.close(fig)
 
 
-def _window_delta_metrics(
+def _overall_delta_rmse(
     baseline_trace: pd.DataFrame,
     variant_trace: pd.DataFrame,
-) -> dict[str, float]:
+) -> float:
     dv = (
         variant_trace["voltage_sim_V"].to_numpy(dtype=float)
         - baseline_trace["voltage_sim_V"].to_numpy(dtype=float)
     )
-    t = baseline_trace["time_in_step_s"].to_numpy(dtype=float)
-    # Keep window definitions unchanged, but downsample only 120s+ region.
-    idx_df = pd.DataFrame(
-        {
-            "time_in_step_s": t,
-            "_row_id": np.arange(len(t), dtype=int),
-        }
-    )
-    idx_downsampled = downsample_for_fitting(
-        idx_df,
-        tail_stride=SENSITIVITY_TAIL_DOWNSAMPLE_STRIDE,
-    )
-    keep_tail_mask = np.zeros(len(t), dtype=bool)
-    keep_tail_mask[idx_downsampled["_row_id"].to_numpy(dtype=int)] = True
-
-    def delta_rmse(mask: np.ndarray) -> float:
-        vals = dv[mask]
-        if vals.size == 0:
-            return float("nan")
-        return float(np.sqrt(np.mean(np.square(vals))))
-
-    return {
-        "delta_rmse_ohmic_0_2s_V": delta_rmse((t >= 0.0) & (t < 2.0)),
-        "delta_rmse_kinetic_2_20s_V": delta_rmse((t >= 2.0) & (t < 20.0)),
-        "delta_rmse_diffusion_20_120s_V": delta_rmse((t >= 20.0) & (t < 120.0)),
-        "delta_rmse_capacity_120plus_s_V": delta_rmse((t >= 120.0) & keep_tail_mask),
-        "delta_rmse_full_profile_V": float(np.sqrt(np.mean(np.square(dv)))),
-    }
-
-
-def _weighted_delta_score(
-    metrics: dict[str, float],
-    rmse_weights: dict[str, float],
-) -> float:
-    pairs = [
-        ("delta_rmse_ohmic_0_2s_V", rmse_weights["ohmic"]),
-        ("delta_rmse_kinetic_2_20s_V", rmse_weights["kinetic"]),
-        ("delta_rmse_diffusion_20_120s_V", rmse_weights["diffusion"]),
-        ("delta_rmse_capacity_120plus_s_V", rmse_weights["capacity"]),
-    ]
-    weighted_sum = 0.0
-    weight_sum = 0.0
-    for name, w in pairs:
-        value = float(metrics[name])
-        if not np.isfinite(value):
-            continue
-        weighted_sum += float(w) * value
-        weight_sum += float(w)
-    if weight_sum <= 0:
+    if dv.size == 0:
         return float("nan")
-    return float(weighted_sum / weight_sum)
+    return float(np.sqrt(np.mean(np.square(dv))))
 
 
 def resolve_candidate_list(
     category: str,
-    args: argparse.Namespace,
 ) -> list[str]:
     if category == "ohmic":
-        if args.sensitivity_include_all_candidates:
-            return list(OHMIC_CANDIDATES)
-        if args.ohmic_parameter is None:
-            return []
-        return [parameter_name_from_selector("ohmic", str(args.ohmic_parameter))]
+        return list(OHMIC_CANDIDATES)
     if category == "kinetic":
-        if args.sensitivity_include_all_candidates:
-            return list(REACTION_CANDIDATES)
-        if args.kinetic_parameter is None:
-            return []
-        return [parameter_name_from_selector("kinetic", str(args.kinetic_parameter))]
+        return list(REACTION_CANDIDATES)
     if category == "diffusion":
-        if args.sensitivity_include_all_candidates:
-            return list(DIFFUSION_CANDIDATES)
-        if args.diffusion_parameter is None:
-            return []
-        return [parameter_name_from_selector("diffusion", str(args.diffusion_parameter))]
+        return list(DIFFUSION_CANDIDATES)
     raise ValueError(f"Unknown category: {category}")
 
 
@@ -220,7 +123,6 @@ def run_sensitivity_analysis(
     args: argparse.Namespace,
     cell_df: pd.DataFrame,
     base_value_map: dict[str, object],
-    rmse_weights: dict[str, float],
     output_dir: Path,
     cell_id: str,
     cycle_range: tuple[int, int] | None,
@@ -256,7 +158,7 @@ def run_sensitivity_analysis(
         parameter_name: str,
         test_value: float,
         test_label: str,
-        metrics: dict[str, float],
+        delta_rmse_full_profile_v: float,
         simulation_status: str = "ok",
         simulation_error: str = "",
     ) -> None:
@@ -268,8 +170,7 @@ def run_sensitivity_analysis(
                 "test_label": test_label,
                 "simulation_status": simulation_status,
                 "simulation_error": simulation_error,
-                **metrics,
-                "delta_weighted_score_V": _weighted_delta_score(metrics, rmse_weights),
+                "delta_rmse_full_profile_V": delta_rmse_full_profile_v,
             }
         )
 
@@ -289,30 +190,17 @@ def run_sensitivity_analysis(
             parameter_name=parameter_name,
             test_value=test_value,
             test_label=test_label,
-            metrics={
-                "delta_rmse_ohmic_0_2s_V": float("nan"),
-                "delta_rmse_kinetic_2_20s_V": float("nan"),
-                "delta_rmse_diffusion_20_120s_V": float("nan"),
-                "delta_rmse_capacity_120plus_s_V": float("nan"),
-                "delta_rmse_full_profile_V": float("nan"),
-            },
+            delta_rmse_full_profile_v=float("nan"),
             simulation_status="failed",
             simulation_error=str(exc),
         )
 
-    baseline_metrics = {
-        "delta_rmse_ohmic_0_2s_V": 0.0,
-        "delta_rmse_kinetic_2_20s_V": 0.0,
-        "delta_rmse_diffusion_20_120s_V": 0.0,
-        "delta_rmse_capacity_120plus_s_V": 0.0,
-        "delta_rmse_full_profile_V": 0.0,
-    }
-    append_result("baseline", "baseline", 1.0, "baseline", baseline_metrics)
+    append_result("baseline", "baseline", 1.0, "baseline", 0.0)
 
     by_category_candidates = {
-        "ohmic": resolve_candidate_list("ohmic", args),
-        "kinetic": resolve_candidate_list("kinetic", args),
-        "diffusion": resolve_candidate_list("diffusion", args),
+        "ohmic": resolve_candidate_list("ohmic"),
+        "kinetic": resolve_candidate_list("kinetic"),
+        "diffusion": resolve_candidate_list("diffusion"),
     }
     for category, candidates in by_category_candidates.items():
         for parameter_name in candidates:
@@ -343,10 +231,16 @@ def run_sensitivity_analysis(
                         exc=exc,
                     )
                     continue
-                metrics = _window_delta_metrics(baseline_trace, variant)
+                delta_rmse_full_profile_v = _overall_delta_rmse(baseline_trace, variant)
                 if float(scale) != 1.0:
                     variants.append((f"{parameter_name} x{float(scale):.3g}", variant))
-                append_result(category, parameter_name, float(scale), f"scale_{scale}", metrics)
+                append_result(
+                    category,
+                    parameter_name,
+                    float(scale),
+                    f"scale_{scale}",
+                    delta_rmse_full_profile_v,
+                )
             if variants:
                 save_sensitivity_voltage_plot(
                     baseline_trace=baseline_trace,
@@ -362,7 +256,7 @@ def run_sensitivity_analysis(
         ["category", "parameter_name"], dropna=False
     )
     for (category, parameter_name), grp in grouped:
-        score_col = "delta_weighted_score_V"
+        score_col = "delta_rmse_full_profile_V"
         valid_scores = grp[np.isfinite(grp[score_col].to_numpy(dtype=float))]
         if valid_scores.empty:
             continue
@@ -380,7 +274,16 @@ def run_sensitivity_analysis(
                 "score_spread_V": spread,
             }
         )
-    ranked_df = pd.DataFrame(ranked_rows).sort_values(
+    ranked_columns = [
+        "category",
+        "parameter_name",
+        "best_test_label",
+        "best_test_value",
+        "best_score_column",
+        "best_score_V",
+        "score_spread_V",
+    ]
+    ranked_df = pd.DataFrame(ranked_rows, columns=ranked_columns).sort_values(
         ["category", "best_score_V", "score_spread_V"], ascending=[True, False, False]
     )
     return details_df, ranked_df
@@ -400,7 +303,6 @@ def main() -> None:
     validate_base_inputs(capacity_ah=float(args.capacity_ah), initial_soc=float(args.initial_soc))
     if len(args.sensitivity_scales) == 0:
         raise ValueError("--sensitivity-scales must include at least one value.")
-    rmse_weights = build_rmse_weights(list(args.rmse_weights))
 
     df = read_and_prepare_data(args.input_csv)
     cell_df = filter_cell_cycles(df=df, cell_id=args.cell, cycle_range=cycle_range)
@@ -410,23 +312,23 @@ def main() -> None:
         parameter_set=args.parameter_set,
         candidate_names=prepared_names,
     )
-    print_phase5_context(
-        target_label="Phase5 sensitivity target",
-        cell_id=args.cell,
-        cycle_range=cycle_range,
-        model_name=args.model_name,
-        parameter_set=args.parameter_set,
-        n_points=len(cell_df),
-        rmse_weights=rmse_weights,
-        base_value_map=base_value_map,
-        missing_names=missing_names,
+    print(
+        f"Phase5 sensitivity target: cell={args.cell}, cycles={cycle_range}, "
+        f"model={args.model_name}, parameter_set={args.parameter_set}, points={len(cell_df)}"
     )
+    for name in sorted(base_value_map):
+        value = base_value_map[name]
+        print(f"Parameter type: {name} -> {type(value).__name__}, callable={callable(value)}")
+    if missing_names:
+        print(
+            "Warning: parameter(s) missing in selected parameter set and skipped: "
+            f"{missing_names}"
+        )
 
     details_df, ranked_df = run_sensitivity_analysis(
         args=args,
         cell_df=cell_df,
         base_value_map=base_value_map,
-        rmse_weights=rmse_weights,
         output_dir=args.output_dir,
         cell_id=args.cell,
         cycle_range=cycle_range,

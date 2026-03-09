@@ -502,25 +502,24 @@ Note: You do not need to simulate every possible combination, nor achieve a "per
 
 ### Phase 5 implementation in this repo
 
-Phase 5 is split into:
+- Phase 5 is split into:
 
-- `phase5_sensitivity.py`: sensitivity analysis and plotting
-- `phase5_run_optimization.py`: optimization run
-- `phase5_evaluate_optimization_runs.py`: DB-backed comparison across optimization runs
+  - `phase5_sensitivity.py`: sensitivity analysis and plotting
+  - `phase5_run_optimization.py`: two-step optimization run (global stage 1 + local stage 2)
+  - `phase5_visualize_history.py`: plots stage 1/2 optimization history (objective/RMSE trends) from CSV outputs.
+  - `phase5_evaluate_optimization_runs.py`: DB-backed comparison across optimization runs
 
 - Supports cycle filtering with `--cycle` (`2` or `1-2`)
 - Replays measured current profile using Phase 2 simulation logic
-- Objective uses weighted sum of category-specific RMSE windows (default `1:1:1:1`):
+- Objective uses weighted sum of category-specific voltage RMSE windows (default `1:1:1:1`):
   - ohmic: `0-2 s` from each step start
   - kinetic: `2-20 s`
   - diffusion: `20-120 s`
   - capacity: `>=120 s`
-- PyBaMM is always solved on the full experimental time grid during optimization (stage 1 and stage 2).
-- Tail downsampling is applied only when computing the capacity window RMSE (`>=120 s`), per step segment:
-  - `--tail-downsample-stride-stage1`: stage-1 capacity-window RMSE stride
-  - `--tail-downsample-stride-stage2`: stage-2/final capacity-window RMSE stride
-- Weights are configurable via `--rmse-weights OHMIC KINETIC DIFFUSION CAPACITY`
-- Primary optimizer is metaheuristic `differential_evolution` (`scipy.optimize`)
+- Optimization weights are configurable via `--rmse-weights OHMIC KINETIC DIFFUSION CAPACITY`
+- Two-step optimization flow:
+  - Stage 1 (global search): `scipy.optimize.differential_evolution` explores the full selected-variable space.
+  - Stage 2 (local refinement): `scipy.optimize.minimize` refines the stage-1 best point using `--local-method` (default `Powell`).
 - Optimization variables (max five):
   - initial SoC (`--optimize-initial-soc`; bounds via `--initial-soc-scale-bounds`)
   - capacity (`--optimize-capacity`; bounds via `--capacity-scale-bounds`)
@@ -532,18 +531,14 @@ Phase 5 is split into:
   - reaction: `Negative/Positive electrode exchange-current density`
   - ohmic: `Negative/Positive electrode conductivity`, `Electrolyte conductivity`
 - Function-valued parameters (e.g., `Electrolyte diffusivity`, `Electrolyte conductivity`, exchange-current densities in `Chen2020`) are scaled by wrapping the original function output.
-- Stage-1 now optimizes all selected variables by default (`--stage1-variable-limit` is deprecated and ignored, kept only for CLI compatibility).
 - Each optimization run now automatically:
   - exports DB-ready artifacts (`*_db_modified_parameters.json`, `*_optimized_cell_config.json`)
   - appends the optimized simulation result to DB (`phase4_database_population.py`, simulation-only mode)
   - calls DB-backed comparison plotting (`phase4_plot_from_db.py`) with current subplot enabled by default
 - Optimization metadata is persisted in DB table `optimization_runs` (linked to `simulation_runs.id`) for traceability.
-- If `--db-parameter-name-extention` collides with an existing parameter-set row that has different overrides, a collision-safe suffix is appended automatically (old rows are preserved).
-- You can start optimization from a previous DB run via `--base-simulation-run-id` or `--base-run-name` (optionally add `--base-run-parameter-name-extention` only when run names are reused and you want explicit disambiguation).
-- `simulation_runs` enforces uniqueness for `(cell, model, parameter_set, run_name)` when `run_name` is not null; this keeps base-run lookup deterministic while allowing the same run name across different cells or parameter sets.
+- You can start optimization from a previous DB run via `--base-simulation-run-id` or `--base-run-name`.
 - Sensitivity uses simulation-vs-simulation deltas (baseline simulated voltage vs perturbed simulated voltage), so experimental voltage is not required for sensitivity scoring.
-- Sensitivity parameter perturbations default to `x0.5, x0.8, x1.0, x1.2, x1.5, x2.0` (that is: `-50%`, `-20%`, baseline, `+20%`, `+50%`, `+100%`).
-- Sensitivity no longer sweeps capacity or initial SoC; those are fixed per run.
+- Sensitivity parameter perturbations default to `x0.2, x0.5, x0.8, x1.0, x1.2, x1.5, x2.0, x5.0` (that is: `-80%`, `-50%`, `-20%`, baseline, `+20%`, `+50%`, `+100%`, `+400%`).
 - `phase5_sensitivity.py` can read capacity/SoC from `data/phase2_cell_config.json` via `--cell-config-json` when `--capacity-ah`/`--initial-soc` are omitted.
 
 #### Run sensitivity analysis first (recommended)
@@ -554,9 +549,7 @@ python phase5_sensitivity.py \
   --cycle 1-2 \
   --model-name SPM \
   --parameter-set Chen2020 \
-  --cell-config-json data/phase2_cell_config.json \
-  --sensitivity-include-all-candidates \
-  --rmse-weights 1 1 1 1
+  --cell-config-json data/phase2_cell_config.json
 ```
 
 Outputs:
